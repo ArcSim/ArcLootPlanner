@@ -1,0 +1,31 @@
+name: Package and release
+
+# Fires when an annotated version tag (e.g. 1.0.0) is pushed. The BigWigs packager
+# builds the addon per .pkgmeta, uploads it to CurseForge (project read from the
+# .toc's X-Curse-Project-ID), and creates the matching GitHub release.
+on:
+  push:
+    tags:
+      - '**'
+
+permissions:
+  contents: write   # lets GITHUB_TOKEN create the GitHub release
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history + tags, needed for version/changelog detection
+
+      - name: Package and release
+        uses: BigWigsMods/packager@v2.5.1
+        with:
+          # Keep the default zip filename; set only the CurseForge display label to
+          # "ArcPings-<version>" (e.g. ArcPings-1.0.0).
+          args: '-n ":{package-name}-{project-version}"'
+        env:
+          CF_API_KEY: ${{ secrets.CF_API_KEY }}        # CurseForge upload token (repo secret)
+          GITHUB_OAUTH: ${{ secrets.GITHUB_TOKEN }}    # auto-provided; for the GitHub release

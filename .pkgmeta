@@ -1,0 +1,18 @@
+# CurseForge / BigWigs packager metadata.
+# Everything listed under `ignore` is left OUT of the packaged addon.
+package-as: ArcBonusRoll
+
+# Use our formatted changelog for the CurseForge file notes, instead of the
+# packager's auto-generated commit-message list.
+manual-changelog:
+  filename: CHANGELOG.md
+  markup-type: markdown
+
+ignore:
+  - .git
+  - .github
+  - .gitignore
+  - .gitattributes
+  - .claude
+  - CLAUDE.md
+  - .pkgmeta
