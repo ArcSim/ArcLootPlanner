@@ -1,9 +1,0 @@
-## Interface: 120100
-## Title: Arc Bonus Roll
-## Notes: Bonus roll ledger, Adventure Guide markers, and coin protection (save your roll for the boss you planned). By the ArcUI author.
-## Author: Arc
-## Version: 1.0.0
-## SavedVariables: ArcBonusRollDB
-
-ArcTheme.lua
-ArcBonusRoll.lua

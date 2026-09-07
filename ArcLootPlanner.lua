@@ -1,5 +1,5 @@
 -- ═══════════════════════════════════════════════════════════════════════════
--- Arc Bonus Roll — roll ledger + Adventure Guide markers + coin protection
+-- Arc Loot Planner - roll ledger + Adventure Guide markers + bonus roll protection
 --
 -- Standalone twin (an ArcUI module version mirrors this file; keep in sync).
 --
@@ -7,7 +7,7 @@
 --   * This addon NEVER calls AcceptSpellConfirmationPrompt or
 --     DeclineSpellConfirmationPrompt. Under any code path. The only thing
 --     that can roll or pass is the player's own click on Blizzard's own
---     LIVE button — so rolling the wrong boss from stale addon state is
+--     LIVE button - so rolling the wrong boss from stale addon state is
 --     structurally impossible, not merely guarded.
 --   * Protection is a CLICK-BLOCKING COVER over Blizzard's button, purely
 --     subtractive. Worst possible failure = a cover shown or hidden
@@ -23,12 +23,12 @@
 --     a small check badge = rolled this week, from the automatic ledger).
 --   * LOOT rows carry the item-level state: bright check = won from a
 --     recorded roll, cyan check = manually checked off ("I already got
---     this from a roll" — the only possible backfill, there is no history
+--     this from a roll" - the only possible backfill, there is no history
 --     API), faint coin = click to check it off. Un-collected items show
 --     an estimated share (1 in N eligible drops under the current filter).
 --     The roll's overall success rate is server-side and never shown.
 --
--- /abr — options window (Arc theme). /abr mock — cover test. No pcall.
+-- /alp (or /abr) - options window (Arc theme). /alp mock - cover test. No pcall.
 -- ═══════════════════════════════════════════════════════════════════════════
 
 local ADDON, NS = ...
@@ -36,7 +36,7 @@ local AT = NS.AT
 
 local COLOR = "|cff33ccff"
 local function Print(msg)
-    print(COLOR .. "Arc Bonus Roll|r: " .. msg)
+    print(COLOR .. "Arc Loot Planner|r: " .. msg)
 end
 
 local TEX_CHECK = "common-icon-checkmark"                       -- atlas
@@ -97,6 +97,7 @@ local function RelinkSpecStores()
     if not (db and char) then return end
     local specID = CurrentSpecID()
     if not specID then return end
+    char.lastSpecID = specID   -- default spec for the cross-character sim picker
     char.specData = char.specData or {}
     local mine = char.specData[specID] or {}
     char.specData[specID] = mine
@@ -118,8 +119,8 @@ local function RelinkSpecStores()
 end
 
 local function InitDB()
-    ArcBonusRollDB = ArcBonusRollDB or {}
-    db = ArcBonusRollDB
+    ArcLootPlannerDB = ArcLootPlannerDB or {}
+    db = ArcLootPlannerDB
     db.chars = db.chars or {}
     local key = CharKey()
     db.chars[key] = db.chars[key] or {}
@@ -172,7 +173,15 @@ local function InitDB()
     if s.planReminder == nil then s.planReminder = true end -- new-week plan nudge
     if s.showOnRaids == nil then s.showOnRaids = true end     -- journal raid pages
     if s.showOnDungeons == nil then s.showOnDungeons = false end -- dungeon/M+ pages
+    -- the two halves of the journal overlay, separately hideable: raw item
+    -- DPS gains, and the bonus-roll dressing (coins, shares, planning)
+    if s.showGains == nil then s.showGains = true end
+    if s.showShares == nil then s.showShares = true end
+    if s.lootRollSim == nil then s.lootRollSim = true end -- need/greed sim tag
     if char.rollBaseline == nil then char.rollBaseline = 0 end -- pre-install rolls
+    -- class stamp: the Sims tab's cross-character import picker needs it to
+    -- list an alt's specs while that alt is offline
+    char.classID = select(3, UnitClass("player")) or char.classID
     -- sim EVs and confirmed pools are PER SPEC and PERSISTENT. Sims are
     -- gear-dependent, so they live per character: char.specData[specID]
     -- .simEV[diff] = { base, t, gains = { [enc] = { [itemID] = gain } } }.
@@ -326,6 +335,26 @@ local function BossKey(enc, diff)
     return tostring(enc) .. ":" .. tostring(diff or 0)
 end
 
+-- Mythic+ bonus rolls are planned per DUNGEON with ONE pool (all bosses'
+-- loot together). Plans/marks/records reuse the boss machinery with the
+-- dungeon's journal instanceID in the encounter slot under this canonical
+-- difficulty key - instance IDs and encounter IDs never collide.
+local MPLUS_DIFF = 8   -- Mythic Keystone
+
+-- the journal's "Keystone Dungeons" AGGREGATE page (journal instance 1319
+-- per wago.tools JournalInstance; no API flag marks it): it repeats loot
+-- the real dungeons already list, so every M+ surface skips it - a coin
+-- there would double-count the season's pool
+local MPLUS_AGGREGATE_INSTANCE = 1319
+
+local function PlanEntryName(enc, diff)
+    if diff == MPLUS_DIFF and EJ_GetInstanceInfo then
+        local n = EJ_GetInstanceInfo(enc)
+        if n then return n end
+    end
+    return EJ_GetEncounterInfo(enc) or ("encounter " .. enc)
+end
+
 local function IsPlanned(week, enc, diff)
     local p = char.plan[week]
     return (p and enc and p[BossKey(enc, diff)]) and true or false
@@ -344,7 +373,7 @@ local function PlannedNames(week)
         local enc, diff = key:match("^(%d+):(%d+)$")
         enc, diff = tonumber(enc), tonumber(diff)
         if enc then
-            local n = (EJ_GetEncounterInfo(enc) or ("encounter " .. enc))
+            local n = PlanEntryName(enc, diff)
             local dn = diff and diff ~= 0 and GetDifficultyInfo(diff) or nil
             if dn then n = n .. " (" .. dn .. ")" end
             names = names and (names .. ", " .. n) or n
@@ -355,11 +384,11 @@ end
 
 -- compact display form: one entry per boss with letter codes for its
 -- planned difficulties - "The Coiled Altar (H)(M), Sszorak (N)"
-local DIFF_CODE = { [14] = "N", [15] = "H", [16] = "M", [17] = "L" }
+local DIFF_CODE = { [14] = "N", [15] = "H", [16] = "M", [17] = "L", [MPLUS_DIFF] = "M+" }
 local function PlannedShort(week)
     local p = char.plan[week]
     if not p then return nil, 0 end
-    local byBoss, order = {}, {}
+    local byBoss, order, entryNames = {}, {}, {}
     for key in pairs(p) do
         local enc, diff = key:match("^(%d+):(%d+)$")
         enc, diff = tonumber(enc), tonumber(diff)
@@ -368,6 +397,7 @@ local function PlannedShort(week)
                 byBoss[enc] = {}
                 order[#order + 1] = enc
             end
+            if not entryNames[enc] then entryNames[enc] = PlanEntryName(enc, diff) end
             local code = DIFF_CODE[diff]
             if not code and diff and diff ~= 0 then
                 local dn = GetDifficultyInfo(diff)
@@ -381,7 +411,7 @@ local function PlannedShort(week)
         table.sort(byBoss[enc])
         local codes = ""
         for _, c in ipairs(byBoss[enc]) do codes = codes .. "(" .. c .. ")" end
-        parts[#parts + 1] = (EJ_GetEncounterInfo(enc) or ("boss " .. enc)) .. " " .. codes
+        parts[#parts + 1] = (entryNames[enc] or ("boss " .. enc)) .. " " .. codes
         count = count + 1
     end
     return table.concat(parts, ", "), count
@@ -455,9 +485,9 @@ local function OnRollFailed()
     end
 end
 
--- ── Coin protection covers ──────────────────────────────────────────────────
+-- ── Bonus roll protection covers ────────────────────────────────────────────
 -- Our own child frames over Blizzard's buttons. We never write to, disable,
--- or re-script the real buttons — Blizzard's own OnShow re-enables the dice
+-- or re-script the real buttons - Blizzard's own OnShow re-enables the dice
 -- button anyway, so covering is both safer and the only stable approach.
 local rollCover, passCover
 local promptToken, unlockedRoll, unlockedPass
@@ -479,7 +509,7 @@ local function MakeCover(anchorButton, unlockKind)
     c.reason = ""
     c:SetScript("OnEnter", function(self)
         GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-        GameTooltip:SetText("Arc Bonus Roll protection", 0.2, 0.8, 1)
+        GameTooltip:SetText("Arc Loot Planner protection", 0.2, 0.8, 1)
         GameTooltip:AddLine(self.reason, 1, 1, 1, true)
         GameTooltip:AddLine("Click this cover once to unlock the button underneath for this prompt.", 0.7, 0.7, 0.7, true)
         GameTooltip:Show()
@@ -516,12 +546,24 @@ UpdateCovers = function()
         local week = CurrentWeek()
         local enc = BonusRollFrame.encounterID
         local diff = BonusRollFrame.difficultyID
+        -- an M+ bonus roll is planned per DUNGEON: match the prompt's
+        -- instance against the dungeon plan too (raid instances can never
+        -- carry a :8 key - only dungeon coins write those)
+        local inst = BonusRollFrame.instanceID
+        local isPlannedHere = (enc and IsPlanned(week, enc, diff))
+            or (inst and IsPlanned(week, inst, MPLUS_DIFF))
         if not HasAnyPlan(week) then
             showRoll = not unlockedRoll
             rollReason = "No planned bosses are set for this week. Pick them in the Adventure Guide (click the coin on a boss), or unlock to roll anyway."
-        elseif enc and IsPlanned(week, enc, diff) then
+        elseif isPlannedHere then
             showPass = char.settings.passGuard and not unlockedPass
-            passReason = ("This is one of your planned bosses (%s) — passing would throw away the roll you saved your coin for."):format(EncounterName(enc))
+            local target
+            if enc and IsPlanned(week, enc, diff) then
+                target = EncounterName(enc)
+            else
+                target = inst and PlanEntryName(inst, MPLUS_DIFF) or "this dungeon"
+            end
+            passReason = ("This is on your planned list (%s) - passing would throw away the roll you saved your coin for."):format(target)
         else
             showRoll = not unlockedRoll
             rollReason = ("Your coins are saved for: %s. Unlock to roll this boss anyway."):format(PlannedNames(week) or "?")
@@ -591,6 +633,29 @@ local function ParseDroptimizerCSV(text)
                     local enc = tonumber(f[2])
                     local item = tonumber(f[11]) or tonumber(f[4])
                     if diff and enc and item then
+                        -- "raid-vault-*" rows are the BONUS ROLL track (a
+                        -- higher item level than the kill drop): they get
+                        -- their own bucket so a drops sim and a bonus roll
+                        -- sim never overwrite each other
+                        local key = src:find("vault") and ("vault" .. diff) or diff
+                        rows[#rows + 1] = { diff = key, enc = enc, item = item, mean = meanN }
+                    end
+                elseif src:find("dungeon") then
+                    -- Dungeon rows carry no per-boss identity (the leading IDs
+                    -- are -1; the bonus-roll "weekly" track puts the DUNGEON's
+                    -- journal instance in slot 2 instead). Pool them under enc
+                    -- -1 in their own STRING diff buckets - journal readers
+                    -- look up numeric diffs, so these stay invisible to the
+                    -- raid overlay and nothing can cross-contaminate.
+                    local diff = src:find("weekly") and "mplusBonus" or "mplus"
+                    -- bonus-roll rows DO carry the dungeon (journal instance
+                    -- in slot 2), and the M+ bonus roll pool is all of a
+                    -- dungeon's bosses in ONE pool - so key those per
+                    -- dungeon. Run rows carry nothing there: pooled under -1.
+                    local enc = (diff == "mplusBonus") and tonumber(f[2]) or nil
+                    if not enc or enc <= 0 then enc = -1 end
+                    local item = tonumber(f[11]) or tonumber(f[4])
+                    if item then
                         rows[#rows + 1] = { diff = diff, enc = enc, item = item, mean = meanN }
                     end
                 end
@@ -611,15 +676,49 @@ local function ParseDroptimizerCSV(text)
     return baseline, out
 end
 
+-- ── Cross-character sim import ──────────────────────────────────────────────
+-- The Sims tab can store a paste into ANY character/spec bucket the addon has
+-- seen (db.chars) - sit on one character and import every alt's Droptimizer.
+-- nil fields mean "this character" / "current (or last-played) spec".
+local simTarget = {}
+
+local function SimTargetKey()
+    return simTarget.charKey or CharKey()
+end
+
+local function SimTargetSpec()
+    if simTarget.specID then return simTarget.specID end
+    local key = SimTargetKey()
+    if key == CharKey() then return CurrentSpecID() end
+    local c = db and db.chars and db.chars[key]
+    return c and c.lastSpecID or nil
+end
+
+local function SpecLabel(specID)
+    if not specID then return "?" end
+    local _, name = GetSpecializationInfoForSpecID(specID)
+    return name or tostring(specID)
+end
+
+local function SimBucketFor(charKey, specID)
+    db.chars[charKey] = db.chars[charKey] or {}
+    local c = db.chars[charKey]
+    c.specData = c.specData or {}
+    c.specData[specID] = c.specData[specID] or {}
+    c.specData[specID].simEV = c.specData[specID].simEV or {}
+    return c.specData[specID].simEV
+end
+
 -- returns: importedDiffCount, itemCount (nil = parse failed)
-local function ApplySimImport(text)
+local function ApplySimImport(text, bucket)
     if not storesLinked then RelinkSpecStores() end
     if not char then return nil end
+    bucket = bucket or simStore
     local baseline, byDiff = ParseDroptimizerCSV(text)
     if not baseline then return nil end
     local diffs, items = 0, 0
     for diff, gains in pairs(byDiff) do
-        simStore[diff] = { base = baseline, t = time(), gains = gains }
+        bucket[diff] = { base = baseline, t = time(), gains = gains }
         diffs = diffs + 1
         for _, encGains in pairs(gains) do
             for _ in pairs(encGains) do items = items + 1 end
@@ -724,19 +823,11 @@ local function ImportFromWowUtils()
     return diffs, items
 end
 
--- Fill the CURRENT spec's sim bucket from the WoWUtils companion when it
--- is empty - never overwrites an existing import. Runs at login and on
--- every spec swap, and it must ANNOUNCE itself on the Sims tab: the silent
--- version re-imported sims seconds after /abr wipe and looked exactly like
--- the wipe failing (WoWUtils keeps its own saved data, which is the point).
-local function AutoImportSims()
-    if not char or next(simStore) then return end
-    local diffs, items = ImportFromWowUtils()
-    if diffs then
-        simStatusMsg = ("|cff4cde4cAuto-imported %d item gains for %s from the WoWUtils addon's saved sims.|r"):format(
-            items, CurrentSpecName())
-    end
-end
+-- NO auto-import from WoWUtils. It ran at login and on spec swap when the
+-- spec's bucket was empty, and its "empty" check could not tell "the user
+-- never imported" from "the user's manual import went to another bucket"
+-- - it overwrote Arc's manual paste. WoWUtils data now arrives ONLY from
+-- the explicit "Import from WoWUtils" button (Arc's call, 2026-09-06).
 
 local function SimGainFor(diff, enc, itemID)
     local ev = char and simStore[diff]
@@ -744,23 +835,69 @@ local function SimGainFor(diff, enc, itemID)
     return g and g[itemID] or nil
 end
 
+-- Set/tier TOKENS: the journal lists the token, but the Droptimizer often
+-- prices only the RESULTING piece with no source reference (class-generic
+-- "Use: create a set item" tokens). A simmed item at a boss that is NOT in
+-- the boss's visible pool is by definition such a conversion result - its
+-- best gain is the token's value.
+local function IsTokenItem(itemID)
+    if not itemID or not C_Item or not C_Item.GetItemInventoryTypeByID then return false end
+    local inv = C_Item.GetItemInventoryTypeByID(itemID)
+    return inv == (Enum.InventoryType and Enum.InventoryType.IndexNonEquipType or 0)
+end
+
+local function OrphanTokenGain(diff, enc, poolDiff, ownedDiff)
+    local ev = char and simStore[diff]
+    local gains = ev and ev.gains[enc]
+    if not gains then return nil end
+    local pool = poolStore[poolDiff or diff] and poolStore[poolDiff or diff][enc]
+    if not (pool and next(pool)) then return nil end
+    local best
+    for itemID, g in pairs(gains) do
+        if pool[itemID] == nil and not IsOwnedItem(itemID, ownedDiff or diff)
+            and (not best or g > best) then
+            best = g
+        end
+    end
+    return best
+end
+
+-- direct gain, else the token fallback (non-equipment journal items only).
+-- poolDiff: the journal-pool bucket when the sim bucket is a vault one.
+local function ItemGainFor(diff, enc, itemID, poolDiff, ownedDiff)
+    local g = SimGainFor(diff, enc, itemID)
+    if g == nil and IsTokenItem(itemID) then
+        g = OrphanTokenGain(diff, enc, poolDiff, ownedDiff)
+    end
+    return g
+end
+
 -- THE one authority for a boss's roll EV: computed from the sim data
 -- alone (sum of un-collected positive gains / count of un-collected sim
 -- items). Never from the journal's shown list - the two disagree (tier
 -- rows carry token itemIDs while sims carry the resulting pieces), which
 -- made a boss's EV change depending on which page was open.
-local function BossSimEV(enc, diff)
+local function BossSimEV(enc, diff, ownedDiff, poolDiff)
+    -- ownedDiff: the marks/won bucket when it differs from the sim bucket
+    -- (M+ dungeons: sims under "mplusBonus", ownership under MPLUS_DIFF).
+    -- poolDiff: the journal-pool bucket (vault sim buckets have no pools of
+    -- their own - the coin draws from the REAL difficulty's loot table).
+    ownedDiff = ownedDiff or diff
+    poolDiff = poolDiff or diff
     local ev = char and simStore[diff]
     local gains = ev and ev.gains[enc]
     if not gains then return nil end
     -- with a cached journal pool, intersect: only items the boss actually
     -- drops count as outcomes (sim-only phantoms are excluded); a pool
     -- item the sim did not value contributes 0 but still dilutes
-    local cache = poolStore[diff] and poolStore[diff][enc]
+    local cache = poolStore[poolDiff] and poolStore[poolDiff][enc]
     local sum, remaining = 0, 0
     if cache and next(cache) then
+        -- pool items only: the bonus roll table carries NO tokens and no
+        -- conversion pieces (Arc's ruling) - token gains price the DROPS
+        -- surfaces, never the coin
         for itemID in pairs(cache) do
-            if not IsOwnedItem(itemID, diff) then
+            if not IsOwnedItem(itemID, ownedDiff) then
                 remaining = remaining + 1
                 local g = gains[itemID]
                 if g and g > 0 then sum = sum + g end
@@ -768,7 +905,7 @@ local function BossSimEV(enc, diff)
         end
     else
         for itemID, g in pairs(gains) do
-            if not IsOwnedItem(itemID, diff) then
+            if not IsOwnedItem(itemID, ownedDiff) then
                 remaining = remaining + 1
                 if g > 0 then sum = sum + g end
             end
@@ -778,6 +915,16 @@ local function BossSimEV(enc, diff)
         return sum / remaining, remaining
     end
     return nil
+end
+
+-- Bonus-roll surfaces prefer the BONUS TRACK sim ("vaultN" bucket, from a
+-- raid-vault Droptimizer) and fall back to the drop sim when none exists.
+-- Drops surfaces always read the plain numeric bucket.
+local function RollSimKey(diff)
+    if type(diff) == "number" and simStore["vault" .. diff] then
+        return "vault" .. diff
+    end
+    return diff
 end
 
 local function SimBaseFor(diff)
@@ -809,11 +956,27 @@ WipeLootPool = function()
     lootPool = nil
 end
 
-local function GetEncounterPool(encID)
-    if not encID then return nil end
-    if not lootPool then
+-- M+ mode: on DUNGEON journal pages every overlay is the Mythic+ bonus
+-- roll layer - one pool for the whole dungeon - regardless of which
+-- dungeon difficulty the journal is showing.
+local function EJDungeonMode()
+    return (EncounterJournal and EncounterJournal:IsShown()
+        and EJ_InstanceIsRaid and not EJ_InstanceIsRaid()) and true or false
+end
+
+local function EJCurrentInstanceID()
+    return EncounterJournal and EncounterJournal.instanceID or nil
+end
+
+local function EnsureLootPool()
+    if lootPool then return end
+    do
         lootPool = {}
+        local dungeonMode = EJDungeonMode()
+        local instID = dungeonMode and EJCurrentInstanceID() or nil
         local diffNow = (EJ_GetDifficulty and EJ_GetDifficulty()) or 0
+        -- ownership in M+ mode lives under the canonical keystone key
+        local ownDiff = dungeonMode and MPLUS_DIFF or diffNow
         -- record the journal pool only when the view is trustworthy: the
         -- player's own class and no slot filter (a narrowed or foreign
         -- view must never overwrite the cached truth)
@@ -847,13 +1010,20 @@ local function GetEncounterPool(encID)
                 pool.total = pool.total + 1
                 if info.itemID and fresh then
                     fresh[info.encounterID] = fresh[info.encounterID] or {}
-                    fresh[info.encounterID][info.itemID] = true
+                    -- link, not just true: tooltips + the gear scan need it
+                    fresh[info.encounterID][info.itemID] = info.link or true
                 end
-                if info.itemID and IsOwnedItem(info.itemID, diffNow) then
+                if info.itemID and IsOwnedItem(info.itemID, ownDiff) then
                     pool.owned = pool.owned + 1
                 elseif info.itemID then
-                    -- un-collected: its sim gain feeds the boss's EV
-                    local gain = SimGainFor(diffNow, info.encounterID, info.itemID)
+                    -- un-collected: its sim gain feeds the boss's EV. M+
+                    -- gains live in the per-dungeon "mplusBonus" bucket.
+                    local gain
+                    if dungeonMode then
+                        gain = instID and SimGainFor("mplusBonus", instID, info.itemID) or nil
+                    else
+                        gain = SimGainFor(diffNow, info.encounterID, info.itemID)
+                    end
                     if gain and gain > 0 then
                         pool.gainSum = pool.gainSum + gain
                     end
@@ -861,21 +1031,87 @@ local function GetEncounterPool(encID)
             end
         end
         if fresh then
-            for enc, set in pairs(fresh) do
-                -- only replace a boss's cached pool with a COMPLETE view of
-                -- it (the list always carries a boss's full table when the
-                -- boss is present at all)
-                poolStore[diffNow] = poolStore[diffNow] or {}
-                poolStore[diffNow][enc] = set
+            if dungeonMode then
+                -- dungeon pages list the whole dungeon's loot - but the loot
+                -- list can BRIEFLY still hold another page's items while an
+                -- instance switch streams in, and the Keystone aggregate
+                -- page lists EVERY season dungeon at once. A blind merge
+                -- accumulated all of that forever (the "dungeon wearing the
+                -- whole season's loot" bug). So: validate every item against
+                -- THIS dungeon's own boss list, REPLACE the pool on a
+                -- full-dungeon view (self-heals old pollution), and only
+                -- merge from single-boss (partial) views.
+                if instID and instID ~= MPLUS_AGGREGATE_INSTANCE and next(fresh) then
+                    local valid = {}
+                    local vi = 1
+                    while true do
+                        local _, _, bossID = EJ_GetEncounterInfoByIndex(vi, instID)
+                        if not bossID then break end
+                        valid[bossID] = true
+                        vi = vi + 1
+                    end
+                    if next(valid) then
+                        local vetted = {}
+                        for enc, set in pairs(fresh) do
+                            if valid[enc] then
+                                for itemID, v in pairs(set) do vetted[itemID] = v end
+                            end
+                        end
+                        if next(vetted) then
+                            poolStore.mplusBonus = poolStore.mplusBonus or {}
+                            local fullView = not (EncounterJournal and EncounterJournal.encounterID)
+                            local union = (not fullView) and (poolStore.mplusBonus[instID] or {}) or {}
+                            for itemID, v in pairs(vetted) do
+                                -- keep a link once we have one; never downgrade
+                                if type(v) == "string" or not union[itemID] then
+                                    union[itemID] = v
+                                end
+                            end
+                            poolStore.mplusBonus[instID] = union
+                        end
+                    end
+                end
+            else
+                for enc, set in pairs(fresh) do
+                    -- only replace a boss's cached pool with a COMPLETE view
+                    -- of it (the list always carries a boss's full table
+                    -- when the boss is present at all)
+                    poolStore[diffNow] = poolStore[diffNow] or {}
+                    poolStore[diffNow][enc] = set
+                end
             end
         end
     end
+end
+
+local function GetEncounterPool(encID)
+    if not encID then return nil end
+    EnsureLootPool()
     return lootPool[encID]
+end
+
+-- the whole-dungeon pool: every boss's rollable loot summed - the M+
+-- bonus roll draws from all of it at once
+local function GetDungeonPool()
+    EnsureLootPool()
+    local agg = { total = 0, owned = 0 }
+    for _, pool in pairs(lootPool) do
+        agg.total = agg.total + pool.total
+        agg.owned = agg.owned + pool.owned
+    end
+    return agg.total > 0 and agg or nil
 end
 
 -- ── Adventure Guide markers ─────────────────────────────────────────────────
 local bossMarkers = {}   -- [bossButton] = marker
 local itemMarkers = {}   -- [itemButton] = marker
+
+-- icon split (Arc's call): the LOOT BAG tags drop-EV lines in the
+-- Adventure Guide; the ALP BADGE (media\arc.tga) is the loot roll
+-- window's mark ONLY
+local LOOT_EV_ICON = "Interface\\GroupFrame\\UI-Group-MasterLooter"
+-- the glowing chest logo (glow-keyed alpha; media\arc is the older ALP disc)
+local ROLL_BADGE_ICON = "Interface\\AddOns\\ArcLootPlanner\\media\\arc_chest"
 
 local function CurrentEJDifficulty()
     local diff = EJ_GetDifficulty and EJ_GetDifficulty() or 0
@@ -928,7 +1164,14 @@ end
 local function BossMarkerUpdate(m)
     local btn = m:GetParent()
     local enc = btn and btn.encounterID
-    if not char or not enc or not char.settings.ejOverlay or not EJViewAllowed() then
+    if not char or not enc or not char.settings.ejOverlay or not EJViewAllowed()
+        or char.settings.showShares == false then
+        m:Hide()
+        return
+    end
+    -- M+ plans are per DUNGEON (one pool, all bosses): the dungeon page's
+    -- title coin owns planning there; boss rows carry no coins
+    if EJDungeonMode() then
         m:Hide()
         return
     end
@@ -970,9 +1213,11 @@ local function BossMarkerUpdate(m)
     m:SetAlpha(1)
     m.badge:SetShown(rec ~= nil)
     -- sim EV per coin: expected DPS gain of rolling this boss right now,
-    -- ALWAYS from BossSimEV so the number is identical on every page
-    local evValue = BossSimEV(enc, diff)
-    m.ev:SetText(evValue and FormatGainNumber(evValue, diff) or "")
+    -- ALWAYS from BossSimEV so the number is identical on every page.
+    -- Bonus-roll surface: the vault-track sim wins when imported.
+    local simKey = RollSimKey(diff)
+    local evValue = BossSimEV(enc, simKey, diff, diff)
+    m.ev:SetText(evValue and FormatGainNumber(evValue, simKey) or "")
 end
 
 local function BossMarkerClick(m, mouseButton)
@@ -1009,7 +1254,7 @@ local function BossMarkerEnter(m)
     if not m.state then return end
     local s = m.state
     GameTooltip:SetOwner(m, "ANCHOR_RIGHT")
-    GameTooltip:SetText("Arc Bonus Roll", 0.2, 0.8, 1)
+    GameTooltip:SetText("Arc Loot Planner", 0.2, 0.8, 1)
     local diff = DifficultyName(s.diff)
     if s.done then
         GameTooltip:AddLine(s.doneManual
@@ -1027,10 +1272,11 @@ local function BossMarkerEnter(m)
         GameTooltip:AddLine(("Rolled this week: %s"):format(s.rec.link or s.rec.result or "?"), 0.3, 1, 0.3, true)
     end
     if not s.done then
-        local evValue, remaining = BossSimEV(s.enc, s.diff)
+        local simKey = RollSimKey(s.diff)
+        local evValue, remaining = BossSimEV(s.enc, simKey, s.diff, s.diff)
         if evValue then
             GameTooltip:AddLine(("Roll EV: |cff4cde4c%s|r per coin, across the %d drops left."):format(
-                FormatGainNumber(evValue, s.diff), remaining), 0.7, 0.7, 0.7, true)
+                FormatGainNumber(evValue, simKey), remaining), 0.7, 0.7, 0.7, true)
         end
     end
     GameTooltip:Show()
@@ -1095,20 +1341,24 @@ local function ItemMarkerUpdate(m)
         return
     end
     -- rows outside the roll table get NO overlay at all: per-player Bonus
-    -- Loot, slotless non-equipment, and rows whose data is still loading
+    -- Loot, slotless non-equipment, and rows whose data is still loading.
+    -- EXCEPTION: a slotless TIER TOKEN row still prices - the sim values
+    -- its conversion pieces, and the token is worth the best of them.
     local info = btn.index and C_EncounterJournal.GetLootInfoByIndex(btn.index) or nil
+    local slotless = info and (not info.slot or info.slot == "")
     if not info or not info.name or info.displayAsPerPlayerLoot
-        or not info.slot or info.slot == "" then
+        or (slotless and not IsTokenItem(btn.itemID)) then
         m:Hide()
         m.pct:Hide()
         if btn.name then btn.name:SetWidth(250) end   -- rows are pool-reused
         return
     end
     m:Show()
-    local diff = CurrentEJDifficulty()
+    local dungeonMode = EJDungeonMode()
+    local diff = dungeonMode and MPLUS_DIFF or CurrentEJDifficulty()
     local owned, source = IsOwnedItem(btn.itemID, diff)
     m.state = { itemID = btn.itemID, enc = btn.encounterID, diff = diff,
-                owned = owned, source = source }
+                owned = owned, source = source, mplus = dungeonMode }
     if owned then
         -- owned = SAME visual as a finished boss: the Voidcore at full
         -- color with the green check overlaid on top
@@ -1119,6 +1369,8 @@ local function ItemMarkerUpdate(m)
         m:SetAlpha(1)
         m.pct:Hide()
         m.pctIcon:Hide()
+        m.pct2:Hide()
+        m.pctIcon2:Hide()
         if btn.name then btn.name:SetWidth(250) end
     else
         -- not looted yet = GRAYED coin (still rollable, still pending);
@@ -1128,26 +1380,75 @@ local function ItemMarkerUpdate(m)
         m.icon:SetVertexColor(1, 1, 1, 1)
         m.check:Hide()
         m:SetAlpha(1)
-        local pool = btn.encounterID and GetEncounterPool(btn.encounterID) or nil
+        -- TWO tagged readouts so they can never be confused (Arc's call):
+        -- [loot bag] drop EV from the DROPS sim, and [coin] the bonus-roll
+        -- part - its EV from the vault/bonus sim when imported, plus the
+        -- share (M+ share = 1 / drops left across the WHOLE dungeon). Each
+        -- half follows its own Journal toggle.
+        local showShares = char.settings.showShares ~= false
+        local showGains = char.settings.showGains ~= false
+        local pool = showShares and (dungeonMode and GetDungeonPool()
+            or (btn.encounterID and GetEncounterPool(btn.encounterID) or nil)) or nil
         local remaining = pool and (pool.total - pool.owned) or 0
-        if remaining > 0 then
-            local txt = ("~%.0f%%"):format(100 / remaining)
-            local gain = SimGainFor(diff, btn.encounterID, btn.itemID)
-            if gain and gain >= 0.5 then
-                txt = ("|cff4cde4c%s|r  "):format(FormatGainNumber(gain, diff)) .. txt
-            elseif gain and gain <= -0.5 then
-                txt = ("|cff8ca0b8%s|r  "):format(FormatGainNumber(gain, diff)) .. txt
+        local dropTxt = ""
+        if showGains then
+            local gain, gainDiff
+            if dungeonMode then
+                gain = SimGainFor("mplus", -1, btn.itemID)
+                gainDiff = "mplus"
+            else
+                gain = ItemGainFor(diff, btn.encounterID, btn.itemID)
+                gainDiff = diff
             end
-            m.pct:SetText(txt)
-            m.pct:Show()
-            m.pctIcon:SetTexture(CoinIconTexture())
-            m.pctIcon:Show()
-            if btn.name then btn.name:SetWidth(168) end
-        else
-            m.pct:Hide()
-            m.pctIcon:Hide()
-            if btn.name then btn.name:SetWidth(250) end
+            if gain and (gain >= 0.5 or gain <= -0.5) then
+                local col = gain >= 0.5 and "|cff4cde4c" or "|cff8ca0b8"
+                dropTxt = ("%s%s|r"):format(col, FormatGainNumber(gain, gainDiff))
+            end
         end
+        local bonusTxt = ""
+        -- token rows carry NO coin line and no share: tokens are not part
+        -- of the bonus roll table (Arc's ruling) - drop pricing only
+        if showShares and not slotless then
+            local bGain, bKey
+            if dungeonMode then
+                local instID = EJCurrentInstanceID()
+                bGain = instID and SimGainFor("mplusBonus", instID, btn.itemID) or nil
+                bKey = "mplusBonus"
+            else
+                bKey = RollSimKey(diff)
+                -- only a real vault/bonus sim prices the coin part: the drop
+                -- sim's number must never wear the coin
+                if bKey ~= diff then bGain = SimGainFor(bKey, btn.encounterID, btn.itemID) end
+            end
+            if bGain and (bGain >= 0.5 or bGain <= -0.5) then
+                local col = bGain >= 0.5 and "|cff4cde4c" or "|cff8ca0b8"
+                bonusTxt = ("%s%s|r"):format(col, FormatGainNumber(bGain, bKey))
+            end
+            if remaining > 0 then
+                bonusTxt = bonusTxt .. (bonusTxt ~= "" and " " or "")
+                    .. ("~%.0f%%"):format(100 / remaining)
+            end
+        end
+        -- fill the two column slots top-down: coin line first, bag line
+        -- below - the icons stay in one aligned lane either way
+        local lines = {}
+        if bonusTxt ~= "" then lines[#lines + 1] = { icon = CoinIconTexture(), text = bonusTxt } end
+        if dropTxt ~= "" then lines[#lines + 1] = { icon = LOOT_EV_ICON, text = dropTxt } end
+        local slots = { { m.pctIcon, m.pct }, { m.pctIcon2, m.pct2 } }
+        for i = 1, 2 do
+            local e = lines[i]
+            local icon, fs = slots[i][1], slots[i][2]
+            if e then
+                icon:SetTexture(e.icon)
+                fs:SetText(e.text)
+                icon:Show()
+                fs:Show()
+            else
+                icon:Hide()
+                fs:Hide()
+            end
+        end
+        if btn.name then btn.name:SetWidth(lines[1] and 170 or 250) end
     end
 end
 
@@ -1172,7 +1473,7 @@ local function ItemMarkerEnter(m)
     if not m.state then return end
     local s = m.state
     GameTooltip:SetOwner(m, "ANCHOR_RIGHT")
-    GameTooltip:SetText("Arc Bonus Roll", 0.2, 0.8, 1)
+    GameTooltip:SetText("Arc Loot Planner", 0.2, 0.8, 1)
     if s.owned then
         if s.source == "auto" then
             local won = wonItems[s.itemID]
@@ -1184,10 +1485,13 @@ local function ItemMarkerEnter(m)
         end
     else
         GameTooltip:AddLine(("Click: check off as received (%s)."):format(DifficultyName(s.diff)), 1, 1, 1)
-        local pool = s.enc and GetEncounterPool(s.enc) or nil
+        local pool = s.mplus and GetDungeonPool()
+            or (s.enc and GetEncounterPool(s.enc) or nil)
         local remaining = pool and (pool.total - pool.owned) or 0
         if remaining > 0 then
-            GameTooltip:AddLine(("One of %d drops you can still receive here (once per difficulty)."):format(remaining), 0.7, 0.7, 0.7, true)
+            GameTooltip:AddLine(s.mplus
+                and ("One of %d drops left across the whole dungeon - the M+ bonus roll pool is every boss together."):format(remaining)
+                or ("One of %d drops you can still receive here (once per difficulty)."):format(remaining), 0.7, 0.7, 0.7, true)
         end
     end
     GameTooltip:Show()
@@ -1215,21 +1519,231 @@ local function DecorateItem(btn)
         -- NAME line (the name is width-clipped to make room - its template
         -- is TOPLEFT + fixed 250px, so SetWidth shortens it cleanly),
         -- with a mini voidcore tag - consistent, nothing floats
-        m.pct = m:CreateFontString(nil, "OVERLAY")
-        m.pct:SetFont(STANDARD_TEXT_FONT, 13, "OUTLINE")
-        m.pct:SetPoint("TOPRIGHT", btn, "TOPRIGHT", -8, -6)
-        m.pct:SetJustifyH("RIGHT")
-        m.pct:SetTextColor(0.25, 0.79, 0.95, 1)
+        -- the readout is a clean two-line COLUMN: icons aligned in their own
+        -- lane (coin above, loot bag directly below), values beside them
         m.pctIcon = m:CreateTexture(nil, "OVERLAY")
         m.pctIcon:SetSize(13, 13)
-        m.pctIcon:SetPoint("RIGHT", m.pct, "LEFT", -4, 0)
+        m.pctIcon:SetPoint("TOPRIGHT", btn, "TOPRIGHT", -104, -6)
         m.pctIcon:Hide()
+        m.pct = m:CreateFontString(nil, "OVERLAY")
+        m.pct:SetFont(STANDARD_TEXT_FONT, 13, "OUTLINE")
+        m.pct:SetPoint("LEFT", m.pctIcon, "RIGHT", 3, 0)
+        m.pct:SetJustifyH("LEFT")
+        m.pct:SetTextColor(0.25, 0.79, 0.95, 1)
+        m.pctIcon2 = m:CreateTexture(nil, "OVERLAY")
+        m.pctIcon2:SetSize(13, 13)
+        m.pctIcon2:SetPoint("TOPRIGHT", btn, "TOPRIGHT", -104, -22)
+        m.pctIcon2:Hide()
+        m.pct2 = m:CreateFontString(nil, "OVERLAY")
+        m.pct2:SetFont(STANDARD_TEXT_FONT, 13, "OUTLINE")
+        m.pct2:SetPoint("LEFT", m.pctIcon2, "RIGHT", 3, 0)
+        m.pct2:SetJustifyH("LEFT")
+        m.pct2:SetTextColor(0.25, 0.79, 0.95, 1)
         m:SetScript("OnClick", ItemMarkerClick)
         m:SetScript("OnEnter", ItemMarkerEnter)
         m:SetScript("OnLeave", function() GameTooltip:Hide() end)
         itemMarkers[btn] = m
     end
     ItemMarkerUpdate(m)
+end
+
+-- ── DUNGEON markers (Mythic+ bonus roll) ────────────────────────────────────
+-- The M+ roll target is the DUNGEON: one coin next to the dungeon page's
+-- title, and one on each tile of the Dungeons grid. Same verbs as a boss
+-- coin - click plans the dungeon, right-click checks it off.
+local dungeonMarker
+local tileMarkers = {}   -- [instanceTileButton] = coin
+
+local function DungeonAutoWouldCheck(instID)
+    local pool = poolStore.mplusBonus and poolStore.mplusBonus[instID]
+    if not (pool and next(pool)) then return false end
+    for itemID in pairs(pool) do
+        if not IsOwnedItem(itemID, MPLUS_DIFF) then return false end
+    end
+    return true
+end
+
+local function DungeonPlanState(instID)
+    local week = CurrentWeek()
+    local doneFlag = char.doneBosses[BossKey(instID, MPLUS_DIFF)]
+    local doneManual = doneFlag == true
+    local doneAuto = doneFlag == nil and DungeonAutoWouldCheck(instID)
+    return { enc = instID, diff = MPLUS_DIFF, week = week,
+             planned = IsPlanned(week, instID, MPLUS_DIFF),
+             done = doneManual or doneAuto, doneManual = doneManual }
+end
+
+local function DungeonMarkerPaint(m, s)
+    m.icon:SetTexture(CoinIconTexture())
+    if s.done then
+        m.icon:SetDesaturated(false)
+        m.planRing:Hide()
+        m.doneCheck:Show()
+    else
+        m.icon:SetDesaturated(not s.planned)
+        m.planRing:SetShown(s.planned)
+        m.doneCheck:Hide()
+    end
+end
+
+local function DungeonMarkerClick(m, mouseButton)
+    if not char or not m.state then return end
+    local s = m.state
+    local key = BossKey(s.enc, s.diff)
+    if mouseButton == "RightButton" then
+        if s.done then
+            -- un-checking stores FALSE when the auto rule would instantly
+            -- re-check, so the player's override sticks (the boss-coin rule)
+            char.doneBosses[key] = DungeonAutoWouldCheck(s.enc) and false or nil
+        else
+            char.doneBosses[key] = true
+        end
+    else
+        if s.done then return end
+        local p = char.plan[s.week]
+        if p and p[key] then
+            p[key] = nil
+            if not next(p) then char.plan[s.week] = nil end
+        else
+            char.plan[s.week] = p or {}
+            char.plan[s.week][key] = true
+        end
+    end
+    RefreshEJ()
+    UpdateCovers()
+    if RefreshWindow then RefreshWindow() end
+end
+
+local function DungeonMarkerEnter(m)
+    if not m.state then return end
+    local s = m.state
+    GameTooltip:SetOwner(m, "ANCHOR_RIGHT")
+    GameTooltip:SetText("Arc Loot Planner", 0.2, 0.8, 1)
+    if s.done then
+        GameTooltip:AddLine(s.doneManual and "Checked off (Mythic+)."
+            or "All M+ roll loot collected.", 0.3, 1, 0.3, true)
+        GameTooltip:AddLine("Right-click: un-check.", 0.7, 0.7, 0.7)
+    elseif s.planned then
+        GameTooltip:AddLine("Planned this week (Mythic+ bonus roll).", 1, 0.85, 0.1)
+        GameTooltip:AddLine("Click: unplan.  Right-click: check off.", 0.7, 0.7, 0.7)
+    else
+        GameTooltip:AddLine(("Click: plan %s for your M+ bonus rolls."):format(
+            PlanEntryName(s.enc, MPLUS_DIFF)), 1, 1, 1, true)
+        GameTooltip:AddLine("One pool: every boss's loot in this dungeon counts.", 0.7, 0.7, 0.7, true)
+        GameTooltip:AddLine("Right-click: check off (done rolling it).", 0.7, 0.7, 0.7)
+    end
+    if not s.done then
+        local evValue, remaining = BossSimEV(s.enc, "mplusBonus", MPLUS_DIFF)
+        if evValue then
+            GameTooltip:AddLine(("Roll EV: |cff4cde4c%s|r per coin, across the %d drops left."):format(
+                FormatGainNumber(evValue, "mplusBonus"), remaining), 0.7, 0.7, 0.7, true)
+        end
+    end
+    GameTooltip:Show()
+end
+
+local function MakeDungeonCoin(parent, size)
+    local m = CreateFrame("Button", nil, parent)
+    m:SetSize(size, size)
+    m:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+    m.icon = m:CreateTexture(nil, "OVERLAY")
+    m.icon:SetAllPoints()
+    m.planRing = m:CreateTexture(nil, "OVERLAY", nil, 2)
+    m.planRing:SetTexture("Interface\\Buttons\\CheckButtonHilight")
+    m.planRing:SetBlendMode("ADD")
+    m.planRing:SetSize(size + 2, size + 2)
+    m.planRing:SetPoint("CENTER")
+    m.planRing:Hide()
+    m.doneCheck = m:CreateTexture(nil, "OVERLAY", nil, 3)
+    m.doneCheck:SetAtlas(TEX_CHECK)
+    m.doneCheck:SetSize(size + 2, size + 2)
+    m.doneCheck:SetPoint("CENTER", 1, -1)
+    m.doneCheck:Hide()
+    -- roll EV readout, boss-coin style: green number centered under the
+    -- coin (the title marker re-anchors its own to the coin's right)
+    m.ev = m:CreateFontString(nil, "OVERLAY")
+    m.ev:SetFont(STANDARD_TEXT_FONT, 10, "OUTLINE")
+    m.ev:SetPoint("TOP", m, "BOTTOM", 0, -1)
+    m.ev:SetTextColor(0.3, 0.87, 0.3, 1)
+    m:SetScript("OnClick", DungeonMarkerClick)
+    m:SetScript("OnEnter", DungeonMarkerEnter)
+    m:SetScript("OnLeave", function() GameTooltip:Hide() end)
+    return m
+end
+
+local function UpdateDungeonMarker()
+    local info = EncounterJournal and EncounterJournal.encounter
+        and EncounterJournal.encounter.info
+    local host = info and info.instanceTitle
+    if not host then
+        if dungeonMarker then dungeonMarker:Hide() end
+        return
+    end
+    if not dungeonMarker then
+        dungeonMarker = MakeDungeonCoin(info, 26)
+        dungeonMarker:SetFrameLevel(info:GetFrameLevel() + 5)
+        -- beside the coin here, not under it: the boss list starts right
+        -- below the title line
+        dungeonMarker.ev:ClearAllPoints()
+        dungeonMarker.ev:SetPoint("LEFT", dungeonMarker, "RIGHT", 5, 0)
+    end
+    local instID = EJCurrentInstanceID()
+    if not (char and instID and char.settings.ejOverlay
+        and EJViewAllowed() and EJDungeonMode())
+        or char.settings.showShares == false
+        or instID == MPLUS_AGGREGATE_INSTANCE then
+        dungeonMarker:Hide()
+        dungeonMarker.ev:SetText("")
+        return
+    end
+    dungeonMarker.state = DungeonPlanState(instID)
+    -- hug the END of the dungeon's name: the title fontstring's RECT can be
+    -- far wider than its text, so measure the string and anchor past it
+    local nameW = (host.GetUnboundedStringWidth and host:GetUnboundedStringWidth())
+        or host:GetStringWidth() or 0
+    dungeonMarker:ClearAllPoints()
+    dungeonMarker:SetPoint("LEFT", host, "LEFT", nameW + 12, 0)
+    dungeonMarker:Show()
+    DungeonMarkerPaint(dungeonMarker, dungeonMarker.state)
+    local evValue = BossSimEV(instID, "mplusBonus", MPLUS_DIFF)
+    dungeonMarker.ev:SetText(evValue and FormatGainNumber(evValue, "mplusBonus") or "")
+end
+
+-- the Dungeons GRID (instance select): a coin on every dungeon tile, so a
+-- week can be planned straight from the season overview. Raid tiles keep
+-- their per-boss planning and get nothing here.
+local function DecorateInstanceTiles()
+    local sel = EncounterJournal and EncounterJournal.instanceSelect
+    local box = sel and sel.ScrollBox
+    if not box then return end
+    local raidTab = EncounterJournal_IsRaidTabSelected
+        and EncounterJournal_IsRaidTabSelected(EncounterJournal)
+    local show = char and char.settings.ejOverlay
+        and char.settings.showOnDungeons == true and not raidTab
+        and char.settings.showShares ~= false
+    box:ForEachFrame(function(btn)
+        local m = tileMarkers[btn]
+        if not show or not btn.instanceID
+            or btn.instanceID == MPLUS_AGGREGATE_INSTANCE then
+            if m then m:Hide() end
+            return
+        end
+        if not m then
+            m = MakeDungeonCoin(btn, 22)
+            -- below the name band (Arc's call: "second row"), so the coin
+            -- never covers the end of a long dungeon name
+            m:SetPoint("TOPRIGHT", btn, "TOPRIGHT", -8, -36)
+            m:SetFrameLevel(btn:GetFrameLevel() + 5)
+            tileMarkers[btn] = m
+        end
+        m.state = DungeonPlanState(btn.instanceID)
+        m:Show()
+        DungeonMarkerPaint(m, m.state)
+        -- per-dungeon roll EV, boss-coin style, straight from the imported
+        -- M+ bonus roll Droptimizer for THIS dungeon
+        local evValue = BossSimEV(btn.instanceID, "mplusBonus", MPLUS_DIFF)
+        m.ev:SetText(evValue and FormatGainNumber(evValue, "mplusBonus") or "")
+    end)
 end
 
 -- Arc-styled info strip on the Adventure Guide: rolls available + planned
@@ -1323,7 +1837,7 @@ local function BuildEJStrip()
     local tag = s:CreateFontString(nil, "OVERLAY")
     tag:SetFont(STANDARD_TEXT_FONT, 12, "")
     tag:SetPoint("LEFT", 10, 0)
-    tag:SetText("|cff3fc9f2Arc|r|cffd5e2f2 Bonus Roll|r")
+    tag:SetText("|cff3fc9f2Arc|r|cffd5e2f2 Loot Planner|r")
     s.icon = s:CreateTexture(nil, "ARTWORK")
     s.icon:SetSize(18, 18)
     s.icon:SetPoint("LEFT", tag, "RIGHT", 12, 0)
@@ -1408,6 +1922,8 @@ RefreshEJ = function()
     for _, m in pairs(itemMarkers) do
         if m:GetParent() and m:GetParent():IsVisible() then ItemMarkerUpdate(m) end
     end
+    UpdateDungeonMarker()
+    DecorateInstanceTiles()
     RefreshEJStrip()
 end
 
@@ -1479,6 +1995,13 @@ local function InstallEJHooks()
             ScheduleEJSettle()
         end)
     end
+    -- the Dungeons/Raids grid: decorate its tiles whenever the list is
+    -- (re)built - After(0) lets the ScrollBox finish laying frames out
+    if EncounterJournal_ListInstances then
+        hooksecurefunc("EncounterJournal_ListInstances", function()
+            C_Timer.After(0, DecorateInstanceTiles)
+        end)
+    end
     BuildEJStrip()
 end
 
@@ -1489,140 +2012,224 @@ if TooltipDataProcessor and TooltipDataProcessor.AddTooltipPostCall then
         if not char or not char.settings.tooltips then return end
         local rec = data and data.id and wonItems[data.id]
         if rec then
-            tooltip:AddLine(COLOR .. "Arc Bonus Roll:|r won from a bonus roll " .. date("%Y-%m-%d", rec.t or 0), 0.4, 0.8, 1)
+            tooltip:AddLine(COLOR .. "Arc Loot Planner:|r won from a bonus roll " .. date("%Y-%m-%d", rec.t or 0), 0.4, 0.8, 1)
         end
     end)
+end
+
+-- ── Sim value on the group loot roll window ─────────────────────────────────
+-- The [loot bag] drop value from the DROPS sim, painted onto the real
+-- need/greed frames (GroupLootFrame1-4) when a roll is up - priced by the
+-- instance you are standing in (raid difficulty bucket, or the M+ runs
+-- bucket in a keystone). Read-only decoration: our own FontString on
+-- Blizzard's frame, hooked OnShow, never touching their fields.
+local lootRollTags = {}   -- [GroupLootFrame] = badge holder
+local mockLootFrame       -- /alp lootroll placement tester
+local lootRollForce = false   -- "/alp lootroll force": fake value on real
+                              -- rolls with no sim data (resets on reload)
+local rollMeasureFS       -- shared ruler for the wrap simulation below
+
+-- Where does the item name's VISIBLE text end? A wrapped FontString only
+-- reports its unwrapped width, so simulate the 125px greedy word wrap the
+-- Name box performs and measure the LAST line. Returns width, lineCount.
+local function NameLastLineWidth(nameFS, boxW)
+    local text = nameFS and nameFS:GetText()
+    if not text or text == "" then return 0, 1 end
+    if not rollMeasureFS then
+        rollMeasureFS = UIParent:CreateFontString(nil, "ARTWORK", "GameFontNormal")
+        rollMeasureFS:Hide()
+    end
+    local fs = rollMeasureFS
+    local function width(s)
+        fs:SetText(s)
+        return (fs.GetUnboundedStringWidth and fs:GetUnboundedStringWidth())
+            or fs:GetStringWidth() or 0
+    end
+    if width(text) <= boxW then return width(text), 1 end
+    local lines, cur = 1, ""
+    for word in text:gmatch("%S+") do
+        local trial = (cur == "") and word or (cur .. " " .. word)
+        if width(trial) <= boxW or cur == "" then
+            cur = trial
+        else
+            lines = lines + 1
+            cur = word
+        end
+    end
+    return width(cur), lines
+end
+
+local function DropGainForHere(itemID)
+    if not itemID or not char then return nil end
+    local _, instanceType, difficultyID = GetInstanceInfo()
+    if type(difficultyID) ~= "number" then return nil end
+    if instanceType == "party" then
+        local ev = simStore.mplus
+        local g = ev and ev.gains[-1]
+        local gain = g and g[itemID] or nil
+        return gain, "mplus"
+    end
+    local ev = simStore[difficultyID]
+    if ev then
+        for _, gains in pairs(ev.gains) do
+            local g = gains[itemID]
+            if g then return g, difficultyID end
+        end
+        -- a TIER TOKEN roll: the token itself is never simmed - price it as
+        -- the best un-collected conversion piece. Without a pool entry the
+        -- token cannot be tied to one boss, so take the best orphan across
+        -- this difficulty's bosses (close enough for a live roll readout).
+        if IsTokenItem(itemID) then
+            local pools = poolStore[difficultyID]
+            if pools then
+                local best
+                for enc in pairs(pools) do
+                    local g = OrphanTokenGain(difficultyID, enc)
+                    if g and (not best or g > best) then best = g end
+                end
+                if best then return best, difficultyID end
+            end
+        end
+    end
+    return nil
+end
+
+local function DecorateLootRoll(frame)
+    if not char then return end
+    local plq = lootRollTags[frame]
+    if char.settings.lootRollSim == false then
+        if plq then plq:Hide() end
+        return
+    end
+    if not plq then
+        -- the ALP BADGE + value, floating right after the item name's text
+        -- (no backdrop - the badge disc is the brand mark, Arc's call)
+        plq = CreateFrame("Frame", nil, frame)
+        plq:SetHeight(20)
+        plq.icon = plq:CreateTexture(nil, "OVERLAY")
+        plq.icon:SetSize(20, 20)   -- the chest needs a touch more room than the disc
+        plq.icon:SetPoint("LEFT", 0, 0)
+        plq.icon:SetTexture(ROLL_BADGE_ICON)
+        plq.text = plq:CreateFontString(nil, "OVERLAY")
+        plq.text:SetFont(STANDARD_TEXT_FONT, 13, "OUTLINE")
+        plq.text:SetPoint("LEFT", plq.icon, "RIGHT", 4, 0)
+        lootRollTags[frame] = plq
+    end
+    local gain = frame._arcTestGain
+    local key = frame._arcTestGain and 15 or nil
+    if gain == nil then
+        local link = frame.rollID and GetLootRollItemLink
+            and GetLootRollItemLink(frame.rollID) or nil
+        gain, key = DropGainForHere(ItemIDFromLink(link))
+    end
+    if gain == nil and lootRollForce and frame.rollID then
+        gain, key = 1234, 15   -- force mode: prove the tag on a REAL roll
+    end
+    if gain and (gain >= 0.5 or gain <= -0.5) then
+        local col = gain >= 0.5 and "|cff4cde4c" or "|cff8ca0b8"
+        plq.text:SetText(("%s%s|r"):format(col, FormatGainNumber(gain, key)))
+        local tw = (plq.text.GetUnboundedStringWidth and plq.text:GetUnboundedStringWidth())
+            or plq.text:GetStringWidth() or 40
+        plq:SetWidth(20 + 4 + tw)
+        -- hug the END of the item name's VISIBLE text: the wrap simulation
+        -- finds the last rendered line's width, and a two-line name drops
+        -- the badge to the second line's level
+        plq:ClearAllPoints()
+        if frame.Name then
+            local lw, lines = NameLastLineWidth(frame.Name, 125)
+            plq:SetPoint("LEFT", frame.Name, "LEFT",
+                math.min(lw, 125) + 5, (lines >= 2) and -8 or 0)
+        else
+            plq:SetPoint("LEFT", frame, "LEFT", 190, 4)
+        end
+        plq:Show()
+    else
+        plq:Hide()
+    end
+end
+
+for i = 1, 4 do
+    local frame = _G["GroupLootFrame" .. i]
+    if frame then
+        frame:HookScript("OnShow", DecorateLootRoll)
+    end
+end
+
+-- /alp lootroll: a REPLICA roll window for placement testing. The real
+-- frame cannot be driven with a fake rollID (Blizzard's OnShow removes it
+-- when the item lookup returns nothing), so the mock is built from the
+-- same template with the scripts stripped and the buttons disabled.
+local function ToggleMockLootRoll()
+    if mockLootFrame and mockLootFrame:IsShown() then
+        mockLootFrame:Hide()
+        return
+    end
+    if not mockLootFrame then
+        local f = CreateFrame("Frame", nil, UIParent, "GroupLootFrameTemplate")
+        f:SetScript("OnShow", nil)
+        f:SetScript("OnHide", nil)
+        f:SetScript("OnEvent", nil)
+        f:SetScript("OnUpdate", nil)
+        f:UnregisterAllEvents()
+        f:SetPoint("CENTER", 0, 120)
+        f:SetFrameStrata("DIALOG")
+        -- REAL look, neutered behavior: the buttons keep their full art
+        -- (disabling desaturates them) but click nothing, and the icon's
+        -- tooltip scripts go because they dereference a live rollID
+        for _, b in ipairs({ f.NeedButton, f.GreedButton, f.PassButton, f.TransmogButton }) do
+            if b then b:SetScript("OnClick", nil) end
+        end
+        if f.IconFrame then
+            f.IconFrame:SetScript("OnEnter", nil)
+            f.IconFrame:SetScript("OnLeave", nil)
+            f.IconFrame:SetScript("OnUpdate", nil)
+            f.IconFrame:SetScript("OnClick", nil)
+        end
+        -- a live frame shows Greed OR Transmog, never both
+        if f.TransmogButton then f.TransmogButton:Hide() end
+        if f.GreedButton then f.GreedButton:Show() end
+        if f.Timer then
+            f.Timer:SetMinMaxValues(0, 60000)
+            f.Timer:SetValue(41000)
+        end
+        mockLootFrame = f
+    end
+    local f = mockLootFrame
+    -- price it with the best real sim item we hold, so the readout is live
+    local itemID, gain = nil, nil
+    for _, d in ipairs({ 15, 16, 14, 17, "mplus" }) do
+        local ev = simStore[d]
+        if ev then
+            for _, gains in pairs(ev.gains) do
+                for id, g in pairs(gains) do
+                    if g and (not gain or g > gain) then itemID, gain = id, g end
+                end
+            end
+            if itemID then break end
+        end
+    end
+    itemID = itemID or 6948   -- Hearthstone, when no sims are in yet
+    f.IconFrame.Icon:SetTexture(C_Item.GetItemIconByID(itemID) or 134400)
+    if f.IconFrame.Count then f.IconFrame.Count:Hide() end
+    f.Name:SetText(C_Item.GetItemInfo(itemID) or "Test Item")
+    -- the exact quality dressing Blizzard's OnShow applies (epic here)
+    local quality = Enum.ItemQuality and Enum.ItemQuality.Epic or 4
+    if ColorManager and ColorManager.GetAtlasDataForLootBorderItemQuality then
+        local atlas = ColorManager.GetAtlasDataForLootBorderItemQuality(quality)
+        if atlas and f.IconFrame.Border then f.IconFrame.Border:SetAtlas(atlas) end
+    end
+    local colorData = ColorManager and ColorManager.GetColorDataForItemQuality
+        and ColorManager.GetColorDataForItemQuality(quality) or nil
+    if colorData then
+        f.Name:SetVertexColor(colorData.r, colorData.g, colorData.b)
+        if f.Border then f.Border:SetVertexColor(colorData.r, colorData.g, colorData.b) end
+    end
+    f._arcTestGain = gain or 1234
+    f:Show()
+    DecorateLootRoll(f)
 end
 
 -- ── Sim import window ───────────────────────────────────────────────────────
-local simWin
-
--- a pasted CSV carries NO spec identity: it stores for the spec you are
--- ON, so the window must say so in your face
-local function SpecNoteText()
-    return ("Importing for |cff3fc9f2%s|r - sims are per spec, so paste a Droptimizer run FOR this spec."):format(CurrentSpecName())
-end
-
-local function ShowSimImport()
-    if simWin then
-        simWin.status:SetText("")
-        simWin.specNote:SetText(SpecNoteText())
-        simWin:Show()
-        return
-    end
-    simWin = AT.CreateWindow("ArcBonusRollSimImport", {
-        title = "|cff3fc9f2Arc|r|cffd5e2f2 Sim Import|r",
-        w = 540, h = 440, minW = 480, minH = 380, resizable = false,
-    })
-    simWin.specNote = simWin:CreateFontString(nil, "OVERLAY")
-    simWin.specNote:SetFont(STANDARD_TEXT_FONT, 11, "")
-    simWin.specNote:SetPoint("TOPLEFT", 14, -28)
-    simWin.specNote:SetTextColor(1, 0.85, 0.1)
-    simWin.specNote:SetText(SpecNoteText())
-    local step1 = simWin:CreateFontString(nil, "OVERLAY")
-    step1:SetFont(STANDARD_TEXT_FONT, 11, "")
-    step1:SetPoint("TOPLEFT", 14, -46)
-    step1:SetTextColor(AT.COL.ink[1], AT.COL.ink[2], AT.COL.ink[3])
-    step1:SetText("|cff3fc9f21.|r Run a Raidbots Droptimizer, then paste the report link here:")
-    local linkBox = CreateFrame("EditBox", nil, simWin, "BackdropTemplate")
-    linkBox:SetSize(500, 20)
-    linkBox:SetPoint("TOPLEFT", 14, -62)
-    AT.Skin(linkBox, AT.COL.well)
-    linkBox:SetFont(STANDARD_TEXT_FONT, 11, "")
-    linkBox:SetTextInsets(6, 6, 0, 0)
-    linkBox:SetTextColor(AT.COL.ink[1], AT.COL.ink[2], AT.COL.ink[3])
-    linkBox:SetAutoFocus(false)
-    linkBox:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
-    local step2 = simWin:CreateFontString(nil, "OVERLAY")
-    step2:SetFont(STANDARD_TEXT_FONT, 11, "")
-    step2:SetPoint("TOPLEFT", 14, -90)
-    step2:SetTextColor(AT.COL.ink[1], AT.COL.ink[2], AT.COL.ink[3])
-    step2:SetText("|cff3fc9f22.|r Open THIS address in your browser (click it, Ctrl+C, paste in Chrome):")
-    local csvBox = CreateFrame("EditBox", nil, simWin, "BackdropTemplate")
-    csvBox:SetSize(500, 20)
-    csvBox:SetPoint("TOPLEFT", 14, -106)
-    AT.Skin(csvBox, AT.COL.well)
-    csvBox:SetFont(STANDARD_TEXT_FONT, 11, "")
-    csvBox:SetTextInsets(6, 6, 0, 0)
-    csvBox:SetTextColor(AT.COL.arc[1], AT.COL.arc[2], AT.COL.arc[3])
-    csvBox:SetAutoFocus(false)
-    csvBox:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
-    -- read-only in spirit: any edit re-derives from the link box, and
-    -- clicking selects the whole address for Ctrl+C
-    csvBox:SetScript("OnEditFocusGained", function(self) self:HighlightText() end)
-    local function SyncCsvBox()
-        local id = (linkBox:GetText() or ""):match("simbot/report/(%w+)")
-            or (linkBox:GetText() or ""):match("/reports/(%w+)")
-        if id then
-            csvBox:SetText("https://www.raidbots.com/reports/" .. id .. "/data.csv")
-        else
-            csvBox:SetText("")
-        end
-    end
-    linkBox:SetScript("OnTextChanged", SyncCsvBox)
-    csvBox:SetScript("OnTextChanged", function(self, userInput) if userInput then SyncCsvBox() end end)
-    local step3 = simWin:CreateFontString(nil, "OVERLAY")
-    step3:SetFont(STANDARD_TEXT_FONT, 11, "")
-    step3:SetPoint("TOPLEFT", 14, -134)
-    step3:SetTextColor(AT.COL.ink[1], AT.COL.ink[2], AT.COL.ink[3])
-    step3:SetText("|cff3fc9f23.|r On that page: select all (Ctrl+A), copy (Ctrl+C), paste it below, Import:")
-    local boxFrame = CreateFrame("Frame", nil, simWin, "BackdropTemplate")
-    boxFrame:SetPoint("TOPLEFT", 14, -150)
-    boxFrame:SetPoint("BOTTOMRIGHT", -14, 76)
-    AT.Skin(boxFrame, AT.COL.well)
-    local eb = CreateFrame("EditBox")
-    eb:SetMultiLine(true)
-    eb:SetFontObject(ChatFontNormal)
-    eb:SetWidth(470)
-    eb:SetAutoFocus(false)
-    eb:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
-    local scroll = AT.MakeScroll(boxFrame, eb)
-    scroll:SetPoint("TOPLEFT", 4, -4)
-    scroll:SetPoint("BOTTOMRIGHT", -10, 4)
-    eb:SetScript("OnTextChanged", function() scroll:UpdateScroll() end)
-    simWin.eb = eb
-    boxFrame:EnableMouse(true)
-    boxFrame:SetScript("OnMouseUp", function() eb:SetFocus() end)
-    local importBtn = AT.MakeSmallButton(simWin, "Import", 100)
-    importBtn:SetPoint("BOTTOMLEFT", 14, 42)
-    -- zero-paste path when the WoWUtils companion addon is installed
-    local wuBtn = AT.MakeSmallButton(simWin, "From WoWUtils", 110)
-    wuBtn:SetPoint("LEFT", importBtn, "RIGHT", 8, 0)
-    simWin.status = simWin:CreateFontString(nil, "OVERLAY")
-    simWin.status:SetFont(STANDARD_TEXT_FONT, 11, "")
-    simWin.status:SetPoint("LEFT", wuBtn, "RIGHT", 12, 0)
-    simWin.status:SetPoint("RIGHT", simWin, "RIGHT", -14, 0)
-    simWin.status:SetJustifyH("LEFT")
-    wuBtn:SetScript("OnClick", function()
-        local diffs, itemsOrErr = ImportFromWowUtils()
-        if diffs then
-            simWin.status:SetText(("|cff4cde4cImported %d item gains (%d difficulty set%s) for %s from WoWUtils.|r"):format(
-                itemsOrErr, diffs, diffs == 1 and "" or "s", CurrentSpecName()))
-            WipeLootPool()
-            RefreshEJ()
-            if RefreshWindow then RefreshWindow() end
-        else
-            simWin.status:SetText("|cffff6060" .. tostring(itemsOrErr) .. "|r")
-        end
-    end)
-    AT.Tooltip(wuBtn, "From WoWUtils",
-        "Reads the droptimizer data the WoWUtils addon already holds for this character and spec - no pasting needed. Newest sim per difficulty wins.")
-    importBtn:SetScript("OnClick", function()
-        local diffs, items = ApplySimImport(simWin.eb:GetText())
-        if diffs then
-            simWin.status:SetText(("|cff4cde4cImported %d item gains (%d difficulty set%s) for %s. The journal now shows EVs.|r"):format(
-                items, diffs, diffs == 1 and "" or "s", CurrentSpecName()))
-            simWin.eb:SetText("")
-            WipeLootPool()
-            RefreshEJ()
-            if RefreshWindow then RefreshWindow() end
-        else
-            simWin.status:SetText("|cffff6060Could not read that. Paste the FULL text of the data.csv page.|r")
-        end
-    end)
-    simWin:Show()
-end
-
 -- The season's current raid: the instance we last saw a roll prompt in,
 -- or the newest raid of the latest journal tier.
 local function GetCurrentRaidInstanceID()
@@ -1670,7 +2277,9 @@ local function HarvestJournalLoot(diff)
             and not info.displayAsPerPlayerLoot
             and info.slot and info.slot ~= "" then
             fresh[info.encounterID] = fresh[info.encounterID] or {}
-            fresh[info.encounterID][info.itemID] = true
+            -- store the LINK (not just true): it carries the difficulty's
+            -- real item level for tooltips and powers the gear scan
+            fresh[info.encounterID][info.itemID] = info.link or true
             got = got + 1
         end
     end
@@ -1780,16 +2389,60 @@ end
 -- settings; History is the ledger, bounded inside the window (the old
 -- single-page layout let it spill past the frame).
 local win
+local pasteEB            -- Sims tab in-tab import (the pop-out window is gone)
+local linkInput = ""
 
 local OVERVIEW_DIFFS = {
     { value = 17, text = "Raid Finder" },
     { value = 14, text = "Normal" },
     { value = 15, text = "Heroic" },
     { value = 16, text = "Mythic" },
+    { value = "mplusBonus", text = "Mythic+" },
 }
 
-local function StatusRow(pg, textFn, h)
-    local row = AT.AddRow(pg, h or 20)
+-- the Drops Overview prices RAW drops: raid difficulties share the same sim
+-- buckets (a drop and a coin give the identical item), Mythic+ uses the
+-- end-of-run sim instead of the bonus track
+local DROPS_DIFFS = {
+    { value = 17, text = "Raid Finder" },
+    { value = 14, text = "Normal" },
+    { value = 15, text = "Heroic" },
+    { value = 16, text = "Mythic" },
+    { value = "mplus", text = "Mythic+ runs" },
+}
+
+-- current season dungeon list: live from the journal engine when it is free
+-- (we select the newest tier ourselves so an open journal on an old
+-- expansion can never mislead it), else the STATIC copy from a past success
+local function GetSeasonDungeonList()
+    local entries = {}
+    if not (EncounterJournal and EncounterJournal:IsShown())
+        and EJ_SelectTier and EJ_GetNumTiers and EJ_GetInstanceByIndex then
+        EJ_SelectTier(EJ_GetNumTiers())
+        local i = 1
+        while true do
+            local id, nm = EJ_GetInstanceByIndex(i, false)
+            if not id then break end
+            if id ~= MPLUS_AGGREGATE_INSTANCE then
+                entries[#entries + 1] = { id = id, name = nm }
+            end
+            i = i + 1
+        end
+    end
+    if #entries > 0 then
+        db.dungeonList = entries
+    elseif db.dungeonList then
+        -- scrub the aggregate from cached lists saved before the filter
+        entries = {}
+        for _, e in ipairs(db.dungeonList) do
+            if e.id ~= MPLUS_AGGREGATE_INSTANCE then entries[#entries + 1] = e end
+        end
+    end
+    return entries
+end
+
+local function StatusRow(pg, textFn, h, visibleFn)
+    local row = AT.AddRow(pg, h or 20, visibleFn)
     local fs = row:CreateFontString(nil, "OVERLAY")
     fs:SetFont(STANDARD_TEXT_FONT, 11, "")
     fs:SetPoint("LEFT", 10, 0)
@@ -1872,7 +2525,13 @@ local function OverviewCoinClick(self, mouseButton)
     local key = BossKey(s.enc, s.diff)
     if mouseButton == "RightButton" then
         if s.done then
-            char.doneBosses[key] = AutoWouldCheck(s.enc, s.diff) and false or nil
+            local wouldAuto
+            if s.mplus then
+                wouldAuto = DungeonAutoWouldCheck(s.enc)
+            else
+                wouldAuto = AutoWouldCheck(s.enc, s.diff)
+            end
+            char.doneBosses[key] = wouldAuto and false or nil
         else
             char.doneBosses[key] = true
         end
@@ -1907,7 +2566,11 @@ local function OverviewCoinTooltip(self)
         GameTooltip:AddLine(("Planned this week (%s)."):format(diff), 1, 0.85, 0.1)
         GameTooltip:AddLine("Click: unplan.  Right-click: check off.", 0.7, 0.7, 0.7)
     else
-        GameTooltip:AddLine(("Click: plan this boss (%s)."):format(diff), 1, 1, 1)
+        GameTooltip:AddLine(("Click: plan this %s (%s)."):format(
+            s.mplus and "dungeon" or "boss", diff), 1, 1, 1)
+        if s.mplus then
+            GameTooltip:AddLine("One pool: every boss's loot in this dungeon counts.", 0.7, 0.7, 0.7, true)
+        end
         GameTooltip:AddLine("Right-click: check off (done rolling it).", 0.7, 0.7, 0.7)
     end
     GameTooltip:Show()
@@ -1917,6 +2580,12 @@ local function OverviewRowClick(self)
     local pg = self.pg
     local s = self.state
     if not (pg and s) then return end
+    if s.topHeader then
+        -- the Drops view's Top 5 section opens and shuts on its header
+        char.settings.dropsTopShut = not char.settings.dropsTopShut or nil
+        if pg.Refresh then pg:Refresh() end
+        return
+    end
     pg.selectedEnc = (pg.selectedEnc ~= s.enc) and s.enc or nil
     if pg.Refresh then pg:Refresh() end
 end
@@ -1942,7 +2611,13 @@ local function OverviewItemTooltip(self)
     local s = self.state
     if not s then return end
     GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-    GameTooltip:SetItemByID(s.itemID)
+    -- the stored journal link carries THIS difficulty's real item level;
+    -- a bare itemID would show the base (wrong-track) version
+    if s.link then
+        GameTooltip:SetHyperlink(s.link)
+    else
+        GameTooltip:SetItemByID(s.itemID)
+    end
     if s.owned then
         GameTooltip:AddLine(s.source == "manual"
             and "Checked off. Click to un-check." or "Won from a recorded roll.", 0.3, 1, 0.3, true)
@@ -1950,6 +2625,49 @@ local function OverviewItemTooltip(self)
         GameTooltip:AddLine("Click: check off as already received on this difficulty.", 0.7, 0.7, 0.7, true)
     end
     GameTooltip:Show()
+end
+
+-- Scan gear from the OVERVIEW: works off the STORED pool links (equipped,
+-- bags, transmog), so unlike the journal button it needs no open guide and
+-- covers every boss/dungeon of the current view at once. Pool entries
+-- saved before link storage cannot be scanned until the guide refreshes
+-- them - the result line says so.
+local function OverviewScan(pg)
+    if not char then return end
+    local diff = (pg.mode == "drops") and (char.settings.dropsDiff or 15)
+        or (char.settings.ovDiff or 15)
+    local ownDiff = (diff == "mplusBonus" or diff == "mplus") and MPLUS_DIFF or diff
+    WipeDetectCache()
+    -- M+ run drops share the bonus pools' item sets (same dungeons)
+    local pools = poolStore[diff] or (diff == "mplus" and poolStore.mplusBonus or nil)
+    local found, unscannable = 0, 0
+    if pools then
+        for _, set in pairs(pools) do
+            for itemID, v in pairs(set) do
+                if not IsOwnedItem(itemID, ownDiff) then
+                    if type(v) == "string" then
+                        if DetectOwnedByLink(v, itemID) then
+                            char.itemMarks[itemID] = char.itemMarks[itemID] or {}
+                            char.itemMarks[itemID][ownDiff] = time()
+                            found = found + 1
+                        end
+                    else
+                        unscannable = unscannable + 1
+                    end
+                end
+            end
+        end
+    end
+    WipeLootPool()
+    RefreshEJ()
+    if RefreshWindow then RefreshWindow() end
+    local msg = ("Scan: |cff4cde4c%d|r newly checked off%s"):format(found,
+        unscannable > 0
+            and (" (%d items need a fresh look - browse this content in the Adventure Guide once, then rescan)"):format(unscannable)
+            or "")
+    C_Timer.After(0.1, function()
+        if pg:IsShown() and pg.hint then pg.hint:SetText(msg) end
+    end)
 end
 
 local function CreateOverviewRow(pg, idx)
@@ -2025,11 +2743,13 @@ local function CreateOverviewRow(pg, idx)
     hintTex:SetAllPoints()
     hintTex:SetTexture("Interface\\Common\\help-i")
     hintTex:SetVertexColor(0.5, 0.62, 0.78, 0.8)
-    row.simHint:SetScript("OnClick", function() ShowSimImport() end)
+    row.simHint:SetScript("OnClick", function()
+        if win and win.SelectTab then win.SelectTab("Sim Import") end
+    end)
     row.simHint:SetScript("OnEnter", function(self)
         GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
         GameTooltip:SetText("No sim value yet", 0.2, 0.8, 1)
-        GameTooltip:AddLine("Import a Droptimizer sim and this boss shows its real roll value in DPS. Click to open the importer.", 1, 1, 1, true)
+        GameTooltip:AddLine("Import a Droptimizer sim and this boss shows its real roll value in DPS. Click to open the Sim Import tab.", 1, 1, 1, true)
         GameTooltip:Show()
     end)
     row.simHint:SetScript("OnLeave", function() GameTooltip:Hide() end)
@@ -2052,11 +2772,40 @@ local function CreateOverviewItemRow(pg, idx)
     AT.Skin(it, AT.COL.well, AT.COL.line)
     it:RegisterForClicks("LeftButtonUp")
     it:SetScript("OnClick", OverviewItemClick)
-    it:SetScript("OnEnter", OverviewItemTooltip)
-    it:SetScript("OnLeave", function() GameTooltip:Hide() end)
     it.icon = it:CreateTexture(nil, "ARTWORK")
     it.icon:SetSize(18, 18)
     it.icon:SetPoint("LEFT", 4, 0)
+    -- the item tooltip only when hovering the ICON itself (Arc's call);
+    -- the hit frame forwards clicks so the whole row still toggles owned
+    it.iconHit = CreateFrame("Button", nil, it)
+    it.iconHit:SetAllPoints(it.icon)
+    it.iconHit:RegisterForClicks("LeftButtonUp")
+    it.iconHit:SetScript("OnClick", function() OverviewItemClick(it) end)
+    it.iconHit:SetScript("OnEnter", function() OverviewItemTooltip(it) end)
+    it.iconHit:SetScript("OnLeave", function() GameTooltip:Hide() end)
+    -- hover affordance IN the row, not a floaty tooltip: an unowned row
+    -- previews a GHOST check over its icon (the exact mark a click will
+    -- set) and the row highlights - the universal "click to check off"
+    -- cue. The bottom hint line and the icon tooltip carry the words.
+    it:SetHighlightTexture("Interface\\Buttons\\WHITE8X8")
+    it:GetHighlightTexture():SetVertexColor(
+        AT.COL.arcDeep[1], AT.COL.arcDeep[2], AT.COL.arcDeep[3], 0.3)
+    it.ghost = it:CreateTexture(nil, "OVERLAY")
+    it.ghost:SetAtlas(TEX_CHECK)
+    it.ghost:SetSize(18, 18)
+    it.ghost:SetPoint("CENTER", it.icon, "CENTER", 1, -1)
+    it.ghost:SetAlpha(0.4)
+    it.ghost:Hide()
+    local function GhostEnter()
+        local s = it.state
+        if s and not s.owned then it.ghost:Show() end
+    end
+    local function GhostLeave() it.ghost:Hide() end
+    it:SetScript("OnEnter", GhostEnter)
+    it:SetScript("OnLeave", GhostLeave)
+    -- the icon's own hit frame eats mouse events; mirror the cue there
+    it.iconHit:HookScript("OnEnter", GhostEnter)
+    it.iconHit:HookScript("OnLeave", GhostLeave)
     it.check = it:CreateTexture(nil, "OVERLAY")
     it.check:SetAtlas(TEX_CHECK)
     it.check:SetSize(18, 18)
@@ -2074,6 +2823,13 @@ local function CreateOverviewItemRow(pg, idx)
     it.gain = it:CreateFontString(nil, "OVERLAY")
     it.gain:SetFont(STANDARD_TEXT_FONT, 11, "")
     it.gain:SetPoint("RIGHT", -8, 0)
+    -- top-upgrade RANK (Drops view): a gold 1-5 left of the gain, the same
+    -- language as the boss rows' BEST tag
+    it.rank = it:CreateFontString(nil, "OVERLAY")
+    it.rank:SetFont(STANDARD_TEXT_FONT, 10, "OUTLINE")
+    it.rank:SetPoint("RIGHT", it.gain, "LEFT", -8, 0)
+    it.rank:SetTextColor(1, 0.85, 0.1, 1)
+    it.rank:Hide()
     pg.itemRows[idx] = it
     return it
 end
@@ -2082,41 +2838,70 @@ local function OverviewRefresh(pg)
     if not char then return end
     PrimePoolCache()   -- self-heals a missing pool in the background
     local diff = char.settings.ovDiff or 15
+    -- Mythic+ mode: rows are DUNGEONS, one pool each. `diff` doubles as the
+    -- sim/pool bucket key ("mplusBonus"); plans/marks/ownership live under
+    -- the canonical keystone difficulty instead.
+    local mplusMode = diff == "mplusBonus"
+    local ownDiff = mplusMode and MPLUS_DIFF or diff
     local week = CurrentWeek()
     local count = BonusRollsAvailable()
     pg.rolls:SetText(count and ("Bonus rolls: |cffffd100%d|r"):format(count) or "Bonus rolls: ?")
     if pg.pctCb then pg.pctCb:SetOn(char.settings.evPercent) end
+    -- bonus-roll surface: the vault-track sim wins when imported, the drop
+    -- sim is the fallback (mplus mode already reads its own bucket)
+    local simKey = mplusMode and diff or RollSimKey(diff)
     -- no sim for this difficulty: pull the list down a notch and show the
     -- import banner in the gap (clicking it opens the importer)
-    local haveSim = simStore[diff] ~= nil
+    local haveSim = simStore[simKey] ~= nil
     if pg.simNotice then
         pg.simNotice:SetShown(not haveSim)
         if not haveSim then
             pg.simNotice.fs:SetText(("|T%d:14|t |cff3fc9f2Sim your character|r to price this page - no %s sim for %s yet. Click to import one."):format(
-                CoinIconTexture(), DifficultyName(diff), CurrentSpecName()))
+                CoinIconTexture(), mplusMode and "Mythic+ bonus roll" or DifficultyName(diff), CurrentSpecName()))
         end
         pg.listScroll:SetPoint("TOPLEFT", 0, haveSim and -34 or -62)
     end
     pg.listContent:SetWidth(math.max(200, pg.listScroll:GetWidth() or 0))
-    local inst = GetCurrentRaidInstanceID()
+    local inst = (not mplusMode) and GetCurrentRaidInstanceID() or nil
     local shown, itemsShown = 0, 0
     local bestIdx, bestEV
     local y = 0
-    if inst and EJ_GetEncounterInfoByIndex then
+    -- live list when the journal engine is free, else the STATIC copy saved
+    -- from an earlier success - the page must never depend on which tab the
+    -- Adventure Guide is parked on
+    local entries
+    if mplusMode then
+        entries = GetSeasonDungeonList()
+    elseif inst and EJ_GetEncounterInfoByIndex then
+        local bosses = {}
         local i = 1
         while true do
-            local bossName, _, bossID = EJ_GetEncounterInfoByIndex(i, inst)
-            if not bossName or not bossID then break end
+            local nm, _, id = EJ_GetEncounterInfoByIndex(i, inst)
+            if not nm or not id then break end
+            bosses[#bosses + 1] = { id = id, name = nm }
+            i = i + 1
+        end
+        if #bosses > 0 then
+            db.bossList = db.bossList or {}
+            db.bossList[inst] = bosses
+        elseif db.bossList and db.bossList[inst] then
+            bosses = db.bossList[inst]
+        end
+        entries = bosses
+    end
+    if entries then
+        for _, boss in ipairs(entries) do
+            local bossName, bossID = boss.name, boss.id
             shown = shown + 1
             local row = pg.rows[shown] or CreateOverviewRow(pg, shown)
             row:ClearAllPoints()
             row:SetPoint("TOPLEFT", 0, y)
             row:SetPoint("TOPRIGHT", 0, y)
             y = y - 30
-            local key = BossKey(bossID, diff)
+            local key = BossKey(bossID, ownDiff)
             local flag = char.doneBosses[key]
             local doneManual = flag == true
-            local evValue = BossSimEV(bossID, diff)
+            local evValue = BossSimEV(bossID, simKey, ownDiff, diff)
             -- the confirmed pool works with no sim at all: it counts what
             -- this boss's coin can still give (once-per-difficulty rule)
             local pool = poolStore[diff] and poolStore[diff][bossID]
@@ -2124,16 +2909,16 @@ local function OverviewRefresh(pg)
             if pool then
                 for itemID in pairs(pool) do
                     poolTotal = poolTotal + 1
-                    if not IsOwnedItem(itemID, diff) then poolLeft = poolLeft + 1 end
+                    if not IsOwnedItem(itemID, ownDiff) then poolLeft = poolLeft + 1 end
                 end
             end
             local doneAuto = false
-            if flag == nil and not evValue and simStore[diff] then
-                local gains = simStore[diff].gains[bossID]
+            if flag == nil and not evValue and simStore[simKey] then
+                local gains = simStore[simKey].gains[bossID]
                 if gains and next(gains) then
                     local anyLeft = false
                     for itemID in pairs(gains) do
-                        if not IsOwnedItem(itemID, diff) then anyLeft = true break end
+                        if not IsOwnedItem(itemID, ownDiff) then anyLeft = true break end
                     end
                     doneAuto = not anyLeft
                 end
@@ -2142,11 +2927,17 @@ local function OverviewRefresh(pg)
                 doneAuto = true   -- pool exhausted = the coin has nothing left
             end
             local done = doneManual or doneAuto
-            local planned = IsPlanned(week, bossID, diff)
+            local planned = IsPlanned(week, bossID, ownDiff)
             local selected = pg.selectedEnc == bossID
-            row.state = { enc = bossID, diff = diff, week = week, name = bossName,
-                          planned = planned, done = done, autoWould = doneAuto }
-            local img = select(5, EJ_GetCreatureInfo(1, bossID))
+            row.state = { enc = bossID, diff = ownDiff, week = week, name = bossName,
+                          planned = planned, done = done, autoWould = doneAuto,
+                          mplus = mplusMode }
+            local img
+            if mplusMode then
+                img = select(6, EJ_GetInstanceInfo(bossID))   -- the dungeon's tile image
+            else
+                img = select(5, EJ_GetCreatureInfo(1, bossID))
+            end
             row.portrait:SetTexture(img or "Interface\\EncounterJournal\\UI-EJ-BOSS-Default")
             AT.Skin(row, selected and AT.COL.panel or AT.COL.box, selected and AT.COL.arcDeep or AT.COL.line)
             row.coin.icon:SetTexture(CoinIconTexture())
@@ -2159,9 +2950,9 @@ local function OverviewRefresh(pg)
             else
                 row.name:SetTextColor(AT.COL.ink[1], AT.COL.ink[2], AT.COL.ink[3], 1)
             end
-            row.rolled:SetShown(GetRollRecord(week, bossID, diff) ~= nil)
+            row.rolled:SetShown(GetRollRecord(week, bossID, ownDiff) ~= nil)
             if evValue then
-                row.ev:SetText(FormatGainNumber(evValue, diff))
+                row.ev:SetText(FormatGainNumber(evValue, simKey))
                 row.evBtn:Show()
                 row.simHint:Hide()
             else
@@ -2181,19 +2972,22 @@ local function OverviewRefresh(pg)
             -- have one (the coin's real table), priced by the sim; the sim
             -- list alone otherwise. Best gain first.
             if selected then
-                local ev = simStore[diff]
+                local ev = simStore[simKey]
                 local gains = ev and ev.gains[bossID]
                 local cache = poolStore[diff] and poolStore[diff][bossID]
                 local list, remaining = {}, 0
                 if cache and next(cache) then
-                    for itemID in pairs(cache) do
-                        list[#list + 1] = { itemID = itemID, gain = gains and gains[itemID] or nil }
-                        if not IsOwnedItem(itemID, diff) then remaining = remaining + 1 end
+                    for itemID, v in pairs(cache) do
+                        list[#list + 1] = { itemID = itemID, gain = gains and gains[itemID] or nil,
+                                            link = (type(v) == "string") and v or nil }
+                        if not IsOwnedItem(itemID, ownDiff) then remaining = remaining + 1 end
                     end
+                    -- NOTE: no token union here (Arc's ruling) - tier
+                    -- conversion pieces belong to the DROPS tab only
                 elseif gains and next(gains) then
                     for itemID, g in pairs(gains) do
                         list[#list + 1] = { itemID = itemID, gain = g }
-                        if not IsOwnedItem(itemID, diff) then remaining = remaining + 1 end
+                        if not IsOwnedItem(itemID, ownDiff) then remaining = remaining + 1 end
                     end
                 end
                 if #list > 0 then
@@ -2207,10 +3001,13 @@ local function OverviewRefresh(pg)
                         it:SetPoint("TOPLEFT", 24, y)
                         it:SetPoint("TOPRIGHT", 0, y)
                         y = y - 26
-                        local owned, source = IsOwnedItem(entry.itemID, diff)
-                        it.state = { itemID = entry.itemID, diff = diff, owned = owned, source = source }
+                        local owned, source = IsOwnedItem(entry.itemID, ownDiff)
+                        it.state = { itemID = entry.itemID, diff = ownDiff, owned = owned,
+                                     source = source, link = entry.link }
                         it.icon:SetTexture(C_Item.GetItemIconByID(entry.itemID) or 134400)
                         it.check:SetShown(owned)
+                        it.ghost:Hide()
+                        it.rank:Hide()
                         it.name:SetText(OverviewItemName(pg, entry.itemID))
                         if owned then
                             it.share:SetText("")
@@ -2218,7 +3015,7 @@ local function OverviewRefresh(pg)
                         else
                             it.share:SetText(remaining > 0 and ("~%.0f%%"):format(100 / remaining) or "")
                             if entry.gain then
-                                it.gain:SetText(FormatGainNumber(entry.gain, diff))
+                                it.gain:SetText(FormatGainNumber(entry.gain, simKey))
                                 if entry.gain >= 0.5 then
                                     it.gain:SetTextColor(0.3, 0.87, 0.3, 1)
                                 else
@@ -2241,7 +3038,10 @@ local function OverviewRefresh(pg)
                     it.state = nil
                     it.icon:SetTexture(134400)
                     it.check:Hide()
-                    it.name:SetText("|cff8ca0b8No data for this boss yet - import a sim, or open the Adventure Guide once.|r")
+                    it.rank:Hide()
+                    it.name:SetText(mplusMode
+                        and "|cff8ca0b8No data for this dungeon yet - import a Mythic+ bonus roll sim, or open its Adventure Guide page once.|r"
+                        or "|cff8ca0b8No data for this boss yet - import a sim, or open the Adventure Guide once.|r")
                     it.share:SetText("")
                     it.gain:SetText("")
                     it:Show()
@@ -2259,13 +3059,15 @@ local function OverviewRefresh(pg)
                     it.state = nil
                     it.icon:SetTexture(CoinIconTexture())
                     it.check:Hide()
-                    it.name:SetText("|cff8ca0b8Confirming this pool from the game's journal data - a few seconds...|r")
+                    it.rank:Hide()
+                    it.name:SetText(mplusMode
+                        and "|cff8ca0b8Sim-priced list - open this dungeon's Adventure Guide page once to confirm its full pool.|r"
+                        or "|cff8ca0b8Confirming this pool from the game's journal data - a few seconds...|r")
                     it.share:SetText("")
                     it.gain:SetText("")
                     it:Show()
                 end
             end
-            i = i + 1
         end
     end
     if bestIdx and pg.rows[bestIdx] then pg.rows[bestIdx].best:Show() end
@@ -2273,34 +3075,390 @@ local function OverviewRefresh(pg)
     for k = itemsShown + 1, #pg.itemRows do pg.itemRows[k]:Hide() end
     pg.listContent:SetHeight(math.max(1, -y + 4))
     pg.listScroll:UpdateScroll()
-    if shown == 0 and inst then
-        -- right after login the journal's data engine has not streamed the
-        -- boss list yet: kick it awake (never while the real journal is
-        -- open) and repaint shortly - the page was staying blank until a
-        -- tab change forced a refresh
-        if not (EncounterJournal and EncounterJournal:IsShown())
+    if shown == 0 and (inst or mplusMode) then
+        -- the journal's data engine has not streamed this list yet (right
+        -- after login, or the Adventure Guide is parked elsewhere). Kick it
+        -- awake when the real journal is closed, and KEEP retrying while
+        -- the page is up - a retry cap left the page stuck on "Loading..."
+        -- forever when the guide sat open. Once a list loads it is saved
+        -- statically (db.bossList / db.dungeonList above), so this path
+        -- only ever runs before the FIRST successful load on this account.
+        local ejBusy = EncounterJournal and EncounterJournal:IsShown()
+        if not ejBusy and not mplusMode
             and EJ_SelectTier and EJ_GetNumTiers and EJ_SelectInstance then
             EJ_SelectTier(EJ_GetNumTiers())
             EJ_SelectInstance(inst)
         end
         pg._loadRetries = (pg._loadRetries or 0) + 1
-        if pg._loadRetries <= 6 then
-            C_Timer.After(0.8, function()
-                if pg:IsShown() then OverviewRefresh(pg) end
-            end)
-        end
-        pg.hint:SetText("Loading the raid list...")
+        local delay = ejBusy and 2 or (pg._loadRetries > 6 and 3 or 0.8)
+        C_Timer.After(delay, function()
+            if pg:IsShown() then OverviewRefresh(pg) end
+        end)
+        pg.hint:SetText(ejBusy
+            and "Waiting for the Adventure Guide to free up the journal data..."
+            or (mplusMode and "Loading the dungeon list..." or "Loading the raid list..."))
     else
         pg._loadRetries = nil
         pg.hint:SetText(shown > 0
-            and "Click a boss to see its gear. Coin: click plans it, right-click checks it off. Per difficulty."
+            and (mplusMode
+                and "Click a dungeon for its pool; click an item to mark it gained. Coin: click plans, right-click checks off. One pool per dungeon."
+                or "Click a boss for its gear; click an item to mark it gained. Coin: click plans, right-click checks off. Per difficulty.")
             or "No raid found yet - open the Adventure Guide once, or import a sim.")
     end
 end
 
-local function BuildOverviewPage(parent)
+-- ── Drops Overview: RAW drop pricing, no coin math ──────────────────────────
+-- Expected value of ONE random drop for a whole DUNGEON: the end-of-run
+-- sim has no per-dungeon identity, so intersect its pooled gains with the
+-- dungeon's confirmed item set - positive gains averaged over every
+-- un-collected item, the same math as a boss's roll EV. (Raid rows use
+-- BossSimEV directly on the drops bucket.)
+local function DropsDungeonEV(instID, ownDiff)
+    local ev = simStore.mplus
+    local g = ev and ev.gains[-1]
+    local pool = poolStore.mplusBonus and poolStore.mplusBonus[instID]
+    if not (g and pool) then return nil end
+    local sum, remaining = 0, 0
+    for itemID in pairs(pool) do
+        if not IsOwnedItem(itemID, ownDiff) then
+            remaining = remaining + 1
+            local gain = g[itemID]
+            if gain and gain > 0 then sum = sum + gain end
+        end
+    end
+    if remaining > 0 and sum > 0 then return sum / remaining, remaining end
+    return nil
+end
+
+-- Same boss/dungeon list look as the Bonus Roll Overview, but the number on
+-- a row is its BEST raw drop gain, the expand ranks every item by gain, and
+-- there are no coins or shares - planning stays a bonus roll thing.
+local function DropsRefresh(pg)
+    if not char then return end
+    PrimePoolCache()
+    local diff = char.settings.dropsDiff or 15
+    local mplusMode = diff == "mplus"
+    local ownDiff = mplusMode and MPLUS_DIFF or diff
+    pg.rolls:SetText("")
+    if pg.pctCb then pg.pctCb:SetOn(char.settings.evPercent) end
+    local haveSim = simStore[diff] ~= nil
+    if pg.simNotice then
+        pg.simNotice:SetShown(not haveSim)
+        if not haveSim then
+            pg.simNotice.fs:SetText(("|T%d:14|t |cff3fc9f2Sim your character|r to price this page - no %s sim for %s yet. Click to import one."):format(
+                CoinIconTexture(), mplusMode and "Mythic+ runs" or DifficultyName(diff), CurrentSpecName()))
+        end
+        pg.listScroll:SetPoint("TOPLEFT", 0, haveSim and -34 or -62)
+    end
+    pg.listContent:SetWidth(math.max(200, pg.listScroll:GetWidth() or 0))
+    local inst = (not mplusMode) and GetCurrentRaidInstanceID() or nil
+    local shown, itemsShown = 0, 0
+    local bestIdx, bestEV
+    local y = 0
+    local entries
+    if mplusMode then
+        entries = GetSeasonDungeonList()
+    elseif inst and EJ_GetEncounterInfoByIndex then
+        local bosses = {}
+        local i = 1
+        while true do
+            local nm, _, id = EJ_GetEncounterInfoByIndex(i, inst)
+            if not nm or not id then break end
+            bosses[#bosses + 1] = { id = id, name = nm }
+            i = i + 1
+        end
+        if #bosses > 0 then
+            db.bossList = db.bossList or {}
+            db.bossList[inst] = bosses
+        elseif db.bossList and db.bossList[inst] then
+            bosses = db.bossList[inst]
+        end
+        entries = bosses
+    end
+    -- TOP 5 UPGRADES across the whole selection, straight from the sim:
+    -- "these are my best possible drops here", ranked, un-collected only
+    local topMap = {}
+    do
+        local ev = simStore[diff]
+        if ev then
+            if mplusMode then
+                for itemID, g in pairs(ev.gains[-1] or {}) do
+                    if g >= 0.5 and not IsOwnedItem(itemID, ownDiff) then
+                        local cur = topMap[itemID]
+                        if not cur or g > cur.gain then topMap[itemID] = { gain = g } end
+                    end
+                end
+            else
+                for enc, gains in pairs(ev.gains) do
+                    for itemID, g in pairs(gains) do
+                        if g >= 0.5 and not IsOwnedItem(itemID, ownDiff) then
+                            local cur = topMap[itemID]
+                            if not cur or g > cur.gain then topMap[itemID] = { gain = g, enc = enc } end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    local top = {}
+    for itemID, e in pairs(topMap) do
+        top[#top + 1] = { itemID = itemID, gain = e.gain, enc = e.enc }
+    end
+    table.sort(top, function(a, b) return a.gain > b.gain end)
+    -- rank map: the gold 1-5 these items wear EVERYWHERE they appear in
+    -- this view (the Top 5 list and inside their boss's expanded gear)
+    local rankOf = {}
+    for i = 1, math.min(5, #top) do rankOf[top[i].itemID] = i end
+    local topShut = char.settings.dropsTopShut == true
+    if entries and #top > 0 then
+        shown = shown + 1
+        local hdr = pg.rows[shown] or CreateOverviewRow(pg, shown)
+        hdr:ClearAllPoints()
+        hdr:SetPoint("TOPLEFT", 0, y)
+        hdr:SetPoint("TOPRIGHT", 0, y)
+        y = y - 30
+        hdr.state = { topHeader = true }
+        hdr.portrait:Hide()
+        AT.Skin(hdr, AT.COL.panel, AT.COL.line)
+        hdr.coin:Hide()
+        hdr.rolled:Hide()
+        -- no portrait here: the title takes its slot (no dead gap)
+        hdr.name:ClearAllPoints()
+        hdr.name:SetPoint("LEFT", 10, 0)
+        hdr.name:SetPoint("RIGHT", hdr, "RIGHT", -160, 0)
+        hdr.name:SetText("Top 5 upgrades")
+        hdr.name:SetTextColor(AT.COL.arc[1], AT.COL.arc[2], AT.COL.arc[3], 1)
+        hdr.ev:SetText("")
+        hdr.evBtn:Hide()
+        hdr.simHint:Hide()
+        hdr.best:Hide()
+        -- the theme's collapse arrow, pinned right: down = open, right = shut
+        if not hdr.colArrow then
+            hdr.colArrow = hdr:CreateTexture(nil, "OVERLAY")
+            hdr.colArrow:SetSize(11, 11)
+            hdr.colArrow:SetPoint("RIGHT", -10, 0)
+        end
+        hdr.colArrow:SetAtlas(topShut and "Options_ListExpand_Right"
+            or "Options_ListExpand_Right_Expanded")
+        hdr.colArrow:SetVertexColor(AT.COL.arc[1], AT.COL.arc[2], AT.COL.arc[3], 1)
+        hdr.colArrow:Show()
+        hdr:Show()
+        if not topShut then
+            for i = 1, math.min(5, #top) do
+                local e = top[i]
+                itemsShown = itemsShown + 1
+                local it = pg.itemRows[itemsShown] or CreateOverviewItemRow(pg, itemsShown)
+                it:ClearAllPoints()
+                it:SetPoint("TOPLEFT", 24, y)
+                it:SetPoint("TOPRIGHT", 0, y)
+                y = y - 26
+                local link
+                if e.enc then
+                    local v = poolStore[diff] and poolStore[diff][e.enc] and poolStore[diff][e.enc][e.itemID]
+                    if type(v) == "string" then link = v end
+                end
+                it.state = { itemID = e.itemID, diff = ownDiff, owned = false, link = link }
+                it.icon:SetTexture(C_Item.GetItemIconByID(e.itemID) or 134400)
+                it.check:Hide()
+                it.ghost:Hide()
+                local nm = OverviewItemName(pg, e.itemID)
+                if e.enc then
+                    -- negative encounters are non-boss sources (-97 =
+                    -- catalyst conversions in the Droptimizer encoding)
+                    nm = nm .. ("  |cff8ca0b8%s|r"):format(
+                        e.enc > 0 and EncounterName(e.enc) or "Catalyst")
+                end
+                it.name:SetText(nm)
+                it.share:SetText("")
+                it.rank:SetText(tostring(i))
+                it.rank:Show()
+                it.gain:SetText(FormatGainNumber(e.gain, diff))
+                it.gain:SetTextColor(0.3, 0.87, 0.3, 1)
+                it:Show()
+            end
+        end
+    end
+    if entries then
+        for _, boss in ipairs(entries) do
+            local bossName, bossID = boss.name, boss.id
+            shown = shown + 1
+            local row = pg.rows[shown] or CreateOverviewRow(pg, shown)
+            row:ClearAllPoints()
+            row:SetPoint("TOPLEFT", 0, y)
+            row:SetPoint("TOPRIGHT", 0, y)
+            y = y - 30
+            local selected = pg.selectedEnc == bossID
+            -- the row's number is the EXPECTED value of one random drop
+            -- here (positive un-collected gains averaged over the pool)
+            local best
+            if mplusMode then
+                best = DropsDungeonEV(bossID, ownDiff)
+            else
+                best = BossSimEV(bossID, diff, ownDiff, diff)
+            end
+            row.state = { enc = bossID, diff = ownDiff, week = 0, name = bossName,
+                          drops = true }
+            local img
+            if mplusMode then
+                img = select(6, EJ_GetInstanceInfo(bossID))
+            else
+                img = select(5, EJ_GetCreatureInfo(1, bossID))
+            end
+            row.portrait:SetTexture(img or "Interface\\EncounterJournal\\UI-EJ-BOSS-Default")
+            row.portrait:Show()   -- the Top 5 header hides it on this pooled row
+            if row.colArrow then row.colArrow:Hide() end
+            row.name:ClearAllPoints()   -- header pulls the title left; restore
+            row.name:SetPoint("LEFT", 32, 0)
+            row.name:SetPoint("RIGHT", row, "RIGHT", -160, 0)
+            AT.Skin(row, selected and AT.COL.panel or AT.COL.box, selected and AT.COL.arcDeep or AT.COL.line)
+            row.coin:Hide()
+            row.rolled:Hide()
+            row.name:SetText(bossName)
+            row.name:SetTextColor(AT.COL.ink[1], AT.COL.ink[2], AT.COL.ink[3], 1)
+            if best then
+                row.ev:SetText(FormatGainNumber(best, diff))
+                row.evBtn:Show()
+                row.simHint:Hide()
+            else
+                row.ev:SetText("")
+                row.evBtn:Hide()
+                row.simHint:Show()
+            end
+            row.best:Hide()
+            if best and (not bestEV or best > bestEV) then
+                bestEV, bestIdx = best, shown
+            end
+            row:Show()
+            if selected then
+                local ev = simStore[diff]
+                local gains, cache
+                if mplusMode then
+                    gains = ev and ev.gains[-1]
+                    cache = poolStore.mplusBonus and poolStore.mplusBonus[bossID]
+                else
+                    gains = ev and ev.gains[bossID]
+                    cache = poolStore[diff] and poolStore[diff][bossID]
+                end
+                local list = {}
+                if cache and next(cache) then
+                    for itemID, v in pairs(cache) do
+                        list[#list + 1] = { itemID = itemID, gain = gains and gains[itemID] or nil,
+                                            link = (type(v) == "string") and v or nil }
+                    end
+                    -- tier token conversion pieces: simmed at this boss but
+                    -- never in the journal pool (the boss drops the slotless
+                    -- token). Raid only - the M+ gains table is dungeon-wide.
+                    if gains and not mplusMode then
+                        for itemID, g in pairs(gains) do
+                            if cache[itemID] == nil then
+                                list[#list + 1] = { itemID = itemID, gain = g, fromToken = true }
+                            end
+                        end
+                    end
+                elseif gains and next(gains) and not mplusMode then
+                    for itemID, g in pairs(gains) do
+                        list[#list + 1] = { itemID = itemID, gain = g }
+                    end
+                end
+                if #list > 0 then
+                    table.sort(list, function(a, b)
+                        return (a.gain or -math.huge) > (b.gain or -math.huge)
+                    end)
+                    for _, entry in ipairs(list) do
+                        itemsShown = itemsShown + 1
+                        local it = pg.itemRows[itemsShown] or CreateOverviewItemRow(pg, itemsShown)
+                        it:ClearAllPoints()
+                        it:SetPoint("TOPLEFT", 24, y)
+                        it:SetPoint("TOPRIGHT", 0, y)
+                        y = y - 26
+                        local owned, source = IsOwnedItem(entry.itemID, ownDiff)
+                        it.state = { itemID = entry.itemID, diff = ownDiff, owned = owned,
+                                     source = source, link = entry.link }
+                        it.icon:SetTexture(C_Item.GetItemIconByID(entry.itemID) or 134400)
+                        it.check:SetShown(owned)
+                        it.ghost:Hide()
+                        it.name:SetText(OverviewItemName(pg, entry.itemID))
+                        it.share:SetText("")
+                        -- a Top 5 item wears its gold rank here too
+                        local r = (not owned) and rankOf[entry.itemID] or nil
+                        if r then
+                            it.rank:SetText(tostring(r))
+                            it.rank:Show()
+                        else
+                            it.rank:Hide()
+                        end
+                        if owned then
+                            it.gain:SetText("")
+                        elseif entry.gain then
+                            it.gain:SetText(FormatGainNumber(entry.gain, diff))
+                            if entry.gain >= 0.5 then
+                                it.gain:SetTextColor(0.3, 0.87, 0.3, 1)
+                            else
+                                it.gain:SetTextColor(0.55, 0.63, 0.76, 1)
+                            end
+                        else
+                            it.gain:SetText("-")
+                            it.gain:SetTextColor(0.55, 0.63, 0.76, 1)
+                        end
+                        it:Show()
+                    end
+                else
+                    itemsShown = itemsShown + 1
+                    local it = pg.itemRows[itemsShown] or CreateOverviewItemRow(pg, itemsShown)
+                    it:ClearAllPoints()
+                    it:SetPoint("TOPLEFT", 24, y)
+                    it:SetPoint("TOPRIGHT", 0, y)
+                    y = y - 26
+                    it.state = nil
+                    it.icon:SetTexture(134400)
+                    it.check:Hide()
+                    it.rank:Hide()
+                    it.name:SetText(mplusMode
+                        and "|cff8ca0b8No data yet - import a Mythic+ runs sim, and open this dungeon's guide page once.|r"
+                        or "|cff8ca0b8No data for this boss yet - import a sim, or open the Adventure Guide once.|r")
+                    it.share:SetText("")
+                    it.gain:SetText("")
+                    it:Show()
+                end
+            end
+        end
+    end
+    if bestIdx and pg.rows[bestIdx] then pg.rows[bestIdx].best:Show() end
+    for k = shown + 1, #pg.rows do pg.rows[k]:Hide() end
+    for k = itemsShown + 1, #pg.itemRows do pg.itemRows[k]:Hide() end
+    pg.listContent:SetHeight(math.max(1, -y + 4))
+    pg.listScroll:UpdateScroll()
+    if shown == 0 and (inst or mplusMode) then
+        local ejBusy = EncounterJournal and EncounterJournal:IsShown()
+        if not ejBusy and not mplusMode
+            and EJ_SelectTier and EJ_GetNumTiers and EJ_SelectInstance then
+            EJ_SelectTier(EJ_GetNumTiers())
+            EJ_SelectInstance(inst)
+        end
+        pg._loadRetries = (pg._loadRetries or 0) + 1
+        local delay = ejBusy and 2 or (pg._loadRetries > 6 and 3 or 0.8)
+        C_Timer.After(delay, function()
+            if pg:IsShown() then DropsRefresh(pg) end
+        end)
+        pg.hint:SetText(ejBusy
+            and "Waiting for the Adventure Guide to free up the journal data..."
+            or (mplusMode and "Loading the dungeon list..." or "Loading the raid list..."))
+    else
+        pg._loadRetries = nil
+        pg.hint:SetText(shown > 0
+            and "Click a row to see every drop ranked by DPS gain. Click an item to check it off as owned."
+            or "No raid found yet - open the Adventure Guide once, or import a sim.")
+    end
+end
+
+local function PageRefresh(pg)
+    if pg.mode == "drops" then DropsRefresh(pg) else OverviewRefresh(pg) end
+end
+
+local function BuildOverviewPage(parent, mode)
     local pg = CreateFrame("Frame", nil, parent)
     pg:Hide()
+    pg.mode = mode   -- nil = Bonus Roll Overview, "drops" = Drops Overview
     pg.rows = {}
     pg.itemRows = {}
     -- the boss/gear list lives in an Arc scroll region (slim cyan thumb)
@@ -2311,9 +3469,16 @@ local function BuildOverviewPage(parent)
     pg.listScroll = scroll
     pg.listContent = content
     local dd = AT.MakeDropdown(win, pg, 130,
-        function() return OVERVIEW_DIFFS end,
-        function() return char.settings.ovDiff or 15 end,
-        function(v) char.settings.ovDiff = v; OverviewRefresh(pg) end)
+        function() return (mode == "drops") and DROPS_DIFFS or OVERVIEW_DIFFS end,
+        function()
+            if mode == "drops" then return char.settings.dropsDiff or 15 end
+            return char.settings.ovDiff or 15
+        end,
+        function(v)
+            if mode == "drops" then char.settings.dropsDiff = v
+            else char.settings.ovDiff = v end
+            PageRefresh(pg)
+        end)
     dd:SetPoint("TOPLEFT", 0, -4)
     -- "Show EV as percent": a real labeled toggle (the bare %/# chip read
     -- as noise) driving the ONE shared setting with the strip and Sims tab
@@ -2331,7 +3496,7 @@ local function BuildOverviewPage(parent)
                                            or SOUNDKIT.IG_MAINMENU_OPTION_CHECKBOX_OFF, "Master")
         RefreshEJ()
         RefreshEJStrip()
-        OverviewRefresh(pg)
+        PageRefresh(pg)
     end
     pctCb:SetScript("OnClick", FlipPct)
     pctCb:HookScript("OnEnter", function() pctCb:SetHover(true) end)
@@ -2361,7 +3526,10 @@ local function BuildOverviewPage(parent)
     notice.fs:SetPoint("RIGHT", -8, 0)
     notice.fs:SetJustifyH("LEFT")
     notice.fs:SetWordWrap(false)
-    notice:SetScript("OnClick", function() AT.CloseDropdown(); ShowSimImport() end)
+    notice:SetScript("OnClick", function()
+        AT.CloseDropdown()
+        if win and win.SelectTab then win.SelectTab("Sim Import") end
+    end)
     notice:SetScript("OnEnter", function(self)
         self:SetBackdropBorderColor(AT.COL.arc[1], AT.COL.arc[2], AT.COL.arc[3], 1)
     end)
@@ -2374,9 +3542,32 @@ local function BuildOverviewPage(parent)
     local journalBtn = AT.MakeSmallButton(pg, "Adventure Guide", 120)
     journalBtn:SetPoint("TOPRIGHT", 0, -3)
     journalBtn:SetScript("OnClick", function() OpenJournalToCurrentRaid() end)
+    -- compact scan button (a labeled one does not fit the top bar): same
+    -- checks as the journal's Scan gear, driven from the stored pools
+    local scanBtn = CreateFrame("Button", nil, pg, "BackdropTemplate")
+    scanBtn:SetSize(22, 22)
+    scanBtn:SetPoint("RIGHT", journalBtn, "LEFT", -8, 0)
+    AT.Skin(scanBtn, AT.COL.btn, AT.COL.steel)
+    local scanTex = scanBtn:CreateTexture(nil, "ARTWORK")
+    scanTex:SetAtlas("common-search-magnifyingglass")
+    scanTex:SetSize(14, 14)
+    scanTex:SetPoint("CENTER")
+    scanTex:SetVertexColor(AT.COL.ink[1], AT.COL.ink[2], AT.COL.ink[3])
+    scanBtn:SetScript("OnEnter", function(self)
+        self:SetBackdropBorderColor(AT.COL.arc[1], AT.COL.arc[2], AT.COL.arc[3], 1)
+        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+        GameTooltip:SetText("Scan gear for looted items", 0.2, 0.8, 1)
+        GameTooltip:AddLine("Checks equipped gear, bags, and your transmog collection against everything on this page, and checks off what you already own.", 1, 1, 1, true)
+        GameTooltip:Show()
+    end)
+    scanBtn:SetScript("OnLeave", function(self)
+        self:SetBackdropBorderColor(AT.COL.steel[1], AT.COL.steel[2], AT.COL.steel[3], 1)
+        GameTooltip:Hide()
+    end)
+    scanBtn:SetScript("OnClick", function() AT.CloseDropdown(); OverviewScan(pg) end)
     pg.rolls = pg:CreateFontString(nil, "OVERLAY")
     pg.rolls:SetFont(STANDARD_TEXT_FONT, 12, "")
-    pg.rolls:SetPoint("RIGHT", journalBtn, "LEFT", -12, 0)
+    pg.rolls:SetPoint("RIGHT", scanBtn, "LEFT", -10, 0)
     pg.rolls:SetTextColor(AT.COL.ink[1], AT.COL.ink[2], AT.COL.ink[3])
     pg.hint = pg:CreateFontString(nil, "OVERLAY")
     pg.hint:SetFont(STANDARD_TEXT_FONT, 10, "")
@@ -2385,9 +3576,9 @@ local function BuildOverviewPage(parent)
     pg.hint:SetJustifyH("LEFT")
     pg.hint:SetTextColor(AT.COL.dim[1], AT.COL.dim[2], AT.COL.dim[3])
     function pg:Refresh()
-        OverviewRefresh(self)
+        PageRefresh(self)
         C_Timer.After(0, function()
-            if self:IsShown() then OverviewRefresh(self) end
+            if self:IsShown() then PageRefresh(self) end
         end)
     end
     return pg
@@ -2431,38 +3622,121 @@ local function BuildHistoryPage(parent)
     return pg
 end
 
+-- ── "Show me how" import walkthrough ────────────────────────────────────────
+-- Shipped screenshots (media\howto_sims_*.png) stepping through the Raw
+-- Files > data.csv shortcut. PNG paths need the extension spelled out
+-- (extensionless SetTexture only resolves .blp/.tga).
+local HOWTO_STEPS = {
+    { tex = "Interface\\AddOns\\ArcLootPlanner\\media\\howto_sims_1.png", w = 1024, h = 490,
+      text = "1. On your Raidbots report page, find the |cff3fc9f2Raw Files|r row at the bottom right, under Simulation Details. Click the three dots |cff3fc9f2...|r next to it (not the Raw Files label), then pick |cff3fc9f2data.csv|r. (Step 2's address on the Sim Import tab opens the exact same page - use whichever you prefer.)" },
+    { tex = "Interface\\AddOns\\ArcLootPlanner\\media\\howto_sims_2.png", w = 1024, h = 557,
+      text = "2. On the page that opens, select everything (|cff3fc9f2Ctrl+A|r) and copy it (|cff3fc9f2Ctrl+C|r). It is a small page - the copy is instant." },
+    { tex = "Interface\\AddOns\\ArcLootPlanner\\media\\howto_sims_3.png", w = 1024, h = 946,
+      text = "3. Back in game: pick the spec the sim is for, click into the paste box, paste (|cff3fc9f2Ctrl+V|r), then press |cff3fc9f2Import pasted text|r. The status line confirms how many item gains were stored." },
+}
+
+local howtoWin, howtoStep
+local function ShowHowTo()
+    if not howtoWin then
+        local IMG_W = 620
+        local hw = AT.CreateWindow("ArcLootPlannerHowTo", {
+            title = "|cff3fc9f2Arc|r|cffd5e2f2 Loot Planner|r - importing a sim",
+            w = IMG_W + 24, h = 490, minW = IMG_W + 24, minH = 490, resizable = false,
+        })
+        -- guide always floats over the window that opened it (twin parity:
+        -- the ArcUI options frame lives at FULLSCREEN_DIALOG)
+        hw:SetFrameStrata("FULLSCREEN_DIALOG")
+        local img = hw:CreateTexture(nil, "ARTWORK")
+        img:SetPoint("TOP", 0, -40)
+        local imgBorder = CreateFrame("Frame", nil, hw, "BackdropTemplate")
+        AT.Skin(imgBorder, { 0, 0, 0, 0 }, AT.COL.line2)
+        imgBorder:SetPoint("TOPLEFT", img, -1, 1)
+        imgBorder:SetPoint("BOTTOMRIGHT", img, 1, -1)
+        local caption = hw:CreateFontString(nil, "OVERLAY")
+        caption:SetFont(STANDARD_TEXT_FONT, 12, "")
+        caption:SetPoint("BOTTOMLEFT", 14, 42)
+        caption:SetPoint("BOTTOMRIGHT", -14, 42)
+        caption:SetJustifyH("LEFT")
+        caption:SetSpacing(3)
+        caption:SetTextColor(AT.COL.ink[1], AT.COL.ink[2], AT.COL.ink[3])
+        local prev = AT.MakeSmallButton(hw, "< Back", 80)
+        prev:SetPoint("BOTTOMLEFT", 12, 10)
+        local nxt = AT.MakeSmallButton(hw, "Next >", 80)
+        nxt:SetPoint("BOTTOMRIGHT", -12, 10)
+        local counter = hw:CreateFontString(nil, "OVERLAY")
+        counter:SetFont(STANDARD_TEXT_FONT, 11, "")
+        counter:SetPoint("BOTTOM", 0, 16)
+        counter:SetTextColor(AT.COL.dim[1], AT.COL.dim[2], AT.COL.dim[3])
+        local function SetStep(i)
+            howtoStep = i
+            local s = HOWTO_STEPS[i]
+            img:SetTexture(s.tex)
+            img:ClearAllPoints()
+            img:SetPoint("TOP", 0, -40)
+            local iw, ih = IMG_W, math.floor(IMG_W * s.h / s.w + 0.5)
+            if ih > 460 then
+                -- tall shots (the in-game step) shrink to keep the window on screen
+                iw = math.floor(IMG_W * 460 / ih + 0.5)
+                ih = 460
+            end
+            img:SetSize(iw, ih)
+            local topUsed = 40 + ih
+            -- caption hugs the image and the window shrinks to fit the step -
+            -- no dead band between screenshot and text
+            caption:ClearAllPoints()
+            caption:SetPoint("TOPLEFT", 14, -(topUsed + 12))
+            caption:SetPoint("TOPRIGHT", -14, -(topUsed + 12))
+            caption:SetText(s.text)
+            local ch = math.max(20, math.ceil(caption:GetStringHeight()))
+            hw:SetHeight(topUsed + 12 + ch + 48)
+            counter:SetText(("Step %d of %d"):format(i, #HOWTO_STEPS))
+            prev:SetShown(i > 1)
+            nxt:SetShown(i < #HOWTO_STEPS)
+        end
+        prev:SetScript("OnClick", function() SetStep(math.max(1, (howtoStep or 1) - 1)) end)
+        nxt:SetScript("OnClick", function() SetStep(math.min(#HOWTO_STEPS, (howtoStep or 1) + 1)) end)
+        hw.SetStep = SetStep
+        howtoWin = hw
+    end
+    howtoWin.SetStep(1)
+    howtoWin:Show()
+    howtoWin:Raise()
+end
+
 local function EnsureWindow()
     if win then return win end
-    win = AT.CreateWindow("ArcBonusRollWindow", {
-        title = "|cff3fc9f2Arc|r|cffd5e2f2 Bonus Roll|r",
+    win = AT.CreateWindow("ArcLootPlannerWindow", {
+        title = "|cff3fc9f2Arc|r|cffd5e2f2 Loot Planner|r",
         version = C_AddOns.GetAddOnMetadata(ADDON, "Version"),
-        w = 530, h = 590, minW = 500, minH = 500,
+        -- six chip tabs need the width (Bonus Roll Overview + Drops Overview)
+        w = 640, h = 590, minW = 620, minH = 500,
     })
 
     local pages = {}
 
     -- Overview + History are hand-built; the rest use the row engine
-    pages.Overview = BuildOverviewPage(win)
+    pages["Bonus Roll Overview"] = BuildOverviewPage(win)
+    pages["Drops Overview"] = BuildOverviewPage(win, "drops")
     pages.History = BuildHistoryPage(win)
 
     local prot = AT.NewPage(win)
     pages.Protection = prot
-    AT.Section(prot, "Coin Protection")
-    AT.RowToggle(prot, "Enable coin protection",
+    AT.Section(prot, "Bonus Roll Protection")
+    AT.RowToggle(prot, "Enable bonus roll protection",
         function() return char.settings.protection end,
         function(v) char.settings.protection = v; UpdateCovers() end,
         nil,
-        "With planned bosses set (pick as many as you like, per difficulty), the roll button on every OTHER boss's prompt is covered by a lock. One click on the lock unlocks it, so it is a speed bump, never a wall. This addon never rolls or passes for you.")
+        "Planned bosses roll freely. Every other boss's roll button gets a lock; one click unlocks it. Never rolls or passes for you.")
     AT.RowToggle(prot, "Guard Pass on your planned bosses",
         function() return char.settings.passGuard end,
         function(v) char.settings.passGuard = v; UpdateCovers() end,
         function() return char.settings.protection end,
-        "On your planned bosses the PASS button gets the lock instead, so you cannot misclick away the roll you saved your coin for.")
+        "On planned bosses the PASS button gets the lock instead, so a misclick cannot throw away your saved roll.")
     AT.RowToggle(prot, "New week plan reminder",
         function() return char.settings.planReminder end,
         function(v) char.settings.planReminder = v end,
         nil,
-        "When a raid week starts with an empty plan and you have used plans or protection before, a small popup reminds you to pick your bosses - at login, when a coin drops, or when a roll prompt appears uncovered. Not this week silences it for the week; planning any boss dismisses it.")
+        "New raid week, no plan: a small popup reminds you to pick bosses. Planning any boss dismisses it.")
     AT.Section(prot, "This Week")
     StatusRow(prot, function()
         local names = PlannedNames(CurrentWeek())
@@ -2483,37 +3757,42 @@ local function EnsureWindow()
     end, nil, 180)
 
     local jour = AT.NewPage(win)
-    pages.Journal = jour
+    pages.Overlays = jour
     AT.Section(jour, "Adventure Guide Markers")
-    AT.RowToggle(jour, "Boss and loot markers",
+    AT.RowToggle(jour, "Adventure Guide overlays (master)",
         function() return char.settings.ejOverlay end,
         function(v) char.settings.ejOverlay = v; RefreshEJ() end,
         nil,
-        "Coin on each boss row = plan your rolls. Checks on loot rows = items already received. Un-collected items show their sim gain and drop share.")
+        "Everything Arc Loot Planner adds to the Adventure Guide: plan coins, EV numbers, drop shares, and the owned check marks on loot icons. Off = the guide is untouched.")
+    AT.RowToggle(jour, "Bonus Roll Sim",
+        function() return char.settings.showShares ~= false end,
+        function(v) char.settings.showShares = v; RefreshEJ() end,
+        function() return char.settings.ejOverlay end,
+        "Everything COIN: the coin line on each item (bonus roll EV plus ~% drop share), the plan coins on bosses, dungeon titles and dungeon tiles, and each boss's per-coin EV.")
+    AT.RowToggle(jour, "Drop Sim",
+        function() return char.settings.showGains ~= false end,
+        function(v) char.settings.showGains = v; RefreshEJ() end,
+        function() return char.settings.ejOverlay end,
+        "The LOOT BAG line on each item: its DPS value if it drops for you, priced by your drops sim. Nothing bonus roll related.")
     AT.RowToggle(jour, "Show on raid pages",
         function() return char.settings.showOnRaids end,
         function(v) char.settings.showOnRaids = v; RefreshEJ(); RefreshEJStrip() end,
         function() return char.settings.ejOverlay end,
-        "Markers and the info bar on the Adventure Guide's raid pages - where bonus rolls happen.")
+        "The overlays above (and the info bar) on the guide's raid pages.")
     AT.RowToggle(jour, "Show on dungeon pages",
         function() return char.settings.showOnDungeons end,
         function(v) char.settings.showOnDungeons = v; RefreshEJ(); RefreshEJStrip() end,
         function() return char.settings.ejOverlay end,
-        "Also decorate dungeon (Mythic+) journal pages. Off by default: bonus roll coins drop from raid bosses.")
-    AT.RowToggle(jour, "Item tooltip notes",
-        function() return char.settings.tooltips end,
-        function(v) char.settings.tooltips = v end,
-        nil,
-        "Adds a line to any item's tooltip when you won that item from a recorded bonus roll.")
+        "The overlays above on dungeon (Mythic+) journal pages, with the coin working per DUNGEON. Off by default.")
     RowButtonPair(jour,
         "Scan gear for looted items", EstimateLootedScan,
         "Open Adventure Guide", OpenJournalToCurrentRaid)
-    AT.Section(jour, "Info Bar")
+    AT.Section(jour, "Adventure Guide Info Bar")
     AT.RowToggle(jour, "Journal info bar",
         function() return char.settings.showStrip end,
         function(v) char.settings.showStrip = v; RefreshEJ() end,
         nil,
-        "The Arc Bonus Roll bar inside the Adventure Guide: rolls available, planned bosses, the roll counter, and the Scan gear button.")
+        "The Arc Loot Planner bar inside the Adventure Guide: rolls available, planned bosses, the roll counter, and the Scan gear button.")
     AT.RowDropdown(jour, win, "Counter shows",
         function() return char.settings.stripCounter end,
         function(v) char.settings.stripCounter = v; RefreshEJ() end,
@@ -2532,6 +3811,18 @@ local function EnsureWindow()
         end,
         function() return char.settings.showStrip and char.settings.stripCounter == "total" end,
         "The addon only sees rolls made after it was installed. Add the rolls you made before, and the total counter includes them.")
+    AT.Section(jour, "Loot Roll Window")
+    AT.RowToggle(jour, "Sim value on loot rolls",
+        function() return char.settings.lootRollSim ~= false end,
+        function(v) char.settings.lootRollSim = v end,
+        nil,
+        "The loot-bag drop value on need/greed roll windows, priced by your drops sim for the instance you are in. Type /alp lootroll for a test window.")
+    AT.Section(jour, "Item Tooltips")
+    AT.RowToggle(jour, "Bonus roll win notes",
+        function() return char.settings.tooltips end,
+        function(v) char.settings.tooltips = v end,
+        nil,
+        "Adds a line to any item's tooltip when you won that item from a recorded bonus roll.")
     AT.Section(jour, "Minimap")
     AT.RowToggle(jour, "Minimap button",
         function() return char.settings.minimap end,
@@ -2540,16 +3831,106 @@ local function EnsureWindow()
             if ApplyMinimapButton then ApplyMinimapButton() end
         end,
         nil,
-        "The coin button on the minimap. Click it to open this window; drag it around the rim to move it.")
+        "The Arc Loot Planner chest button on the minimap. Click it to open this window; drag it around the rim to move it.")
 
     local sims = AT.NewPage(win)
-    pages.Sims = sims
-    AT.Section(sims, "Import")
+    pages["Sim Import"] = sims
+    AT.Section(sims, "Import a Raidbots Droptimizer")
+    AT.RowButton(sims, "Show me how (screenshots)", ShowHowTo, nil, 210)
     StatusRow(sims, function()
-        return ("Sims are |cffffd100per spec|r. Importing now stores for: |cff3fc9f2%s|r"):format(CurrentSpecName())
+        return ("Sims are |cffffd100per spec|r. Importing stores for: |cff3fc9f2%s|r"):format(
+            SpecLabel(SimTargetSpec()))
     end)
+    -- sims are per spec: pick which of THIS character's specs the paste is
+    -- for, so all specs can be imported without swapping between them.
+    -- (Cross-character import exists in the backend - SimBucketFor takes any
+    -- charKey - but the picker is deliberately not shown for now.)
+    AT.RowDropdown(sims, win, "For spec",
+        function() return SimTargetSpec() end,
+        function(v) simTarget.specID = v end,
+        function()
+            local items = {}
+            local classID = select(3, UnitClass("player"))
+            local n = classID and C_SpecializationInfo.GetNumSpecializationsForClassID(classID) or 0
+            for i = 1, n do
+                local id, name = GetSpecializationInfoForClassID(classID, i)
+                if id then items[#items + 1] = { value = id, text = name } end
+            end
+            return items
+        end,
+        nil,
+        function() if sims.Refresh then sims:Refresh() end end)
+    -- the 3-step wizard lives IN the tab now (matches the ArcUI twin):
+    -- link in, derived data.csv address out, paste below, Import
+    AT.RowInput(sims, "1. Report link",
+        function() return linkInput end,
+        function(v)
+            linkInput = v or ""
+            if sims.Refresh then sims:Refresh() end   -- re-derive step 2 now
+        end,
+        nil,
+        "Run a Raidbots Droptimizer for the spec you are on, then paste the report link here.",
+        nil,
+        true)   -- live: step 2 must populate the moment the link is pasted
+    AT.RowInput(sims, "2. Open THIS address",
+        function()
+            local id = linkInput:match("simbot/report/(%w+)") or linkInput:match("/reports/(%w+)")
+            return id and ("https://www.raidbots.com/reports/" .. id .. "/data.csv") or ""
+        end,
+        function() end,
+        nil,
+        "Click in, select all (Ctrl+A), copy (Ctrl+C), open it in your browser, then copy that page's full text. Shortcut: the Raw Files ... menu on the report page itself opens the same data.csv - press Show me how for pictures.")
+    local pasteRow = AT.AddRow(sims, 118)
+    local pasteLabel = pasteRow:CreateFontString(nil, "OVERLAY")
+    pasteLabel:SetFont(STANDARD_TEXT_FONT, 11, "")
+    pasteLabel:SetPoint("TOPLEFT", 10, -4)
+    pasteLabel:SetTextColor(AT.COL.ink[1], AT.COL.ink[2], AT.COL.ink[3])
+    pasteLabel:SetText("3. Paste the page's FULL text below, then press Import:")
+    local pasteFrame = CreateFrame("Frame", nil, pasteRow, "BackdropTemplate")
+    pasteFrame:SetPoint("TOPLEFT", 10, -20)
+    pasteFrame:SetPoint("BOTTOMRIGHT", -10, 6)
+    AT.Skin(pasteFrame, AT.COL.well)
+    local eb = CreateFrame("EditBox")
+    eb:SetMultiLine(true)
+    eb:SetFontObject(ChatFontNormal)
+    eb:SetWidth(430)
+    eb:SetAutoFocus(false)
+    eb:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
+    local pasteScroll = AT.MakeScroll(pasteFrame, eb)
+    pasteScroll:SetPoint("TOPLEFT", 4, -4)
+    pasteScroll:SetPoint("BOTTOMRIGHT", -10, 4)
+    eb:SetScript("OnTextChanged", function() pasteScroll:UpdateScroll() end)
+    pasteFrame:EnableMouse(true)
+    pasteFrame:SetScript("OnMouseUp", function() eb:SetFocus() end)
+    pasteEB = eb
     RowButtonPair(sims,
-        "Paste a Droptimizer CSV", ShowSimImport,
+        "Import pasted text", function()
+            local targetKey, targetSpec = SimTargetKey(), SimTargetSpec()
+            if not targetSpec then
+                simStatusMsg = "|cffff6060Pick a spec to import for first.|r"
+                if RefreshWindow then RefreshWindow() end
+                return
+            end
+            local bucket = SimBucketFor(targetKey, targetSpec)
+            local diffs, items = ApplySimImport(pasteEB and pasteEB:GetText() or "", bucket)
+            if diffs then
+                simStatusMsg = ("|cff4cde4cImported %d item gains (%d difficulty set%s) for %s.|r"):format(
+                    items, diffs, diffs == 1 and "" or "s", SpecLabel(targetSpec))
+                pasteEB:SetText("")
+                if targetKey == CharKey() and targetSpec == CurrentSpecID() then
+                    WipeLootPool()
+                    RefreshEJ()
+                end
+            else
+                local raw = pasteEB and pasteEB:GetText() or ""
+                if raw:find("^%s*[%[{]") then
+                    simStatusMsg = "|cffff6060That is the data.json - not needed, and far too big. Open the data.csv instead (press Show me how).|r"
+                else
+                    simStatusMsg = "|cffff6060Could not read that. Paste the FULL text of the data.csv page.|r"
+                end
+            end
+            if RefreshWindow then RefreshWindow() end
+        end,
         "Import from WoWUtils", function()
             local diffs, itemsOrErr = ImportFromWowUtils()
             if diffs then
@@ -2563,37 +3944,75 @@ local function EnsureWindow()
             if RefreshWindow then RefreshWindow() end
         end)
     StatusRow(sims, function() return simStatusMsg end)
-    AT.RowButton(sims, "Clear this spec's sims", function()
-        wipe(simStore)
-        simStatusMsg = ("|cffffd100Cleared all imported sims for %s.|r"):format(CurrentSpecName())
+    AT.RowButton(sims, "Clear the selected spec's sims", function()
+        local targetKey, targetSpec = SimTargetKey(), SimTargetSpec()
+        if not targetSpec then return end
+        wipe(SimBucketFor(targetKey, targetSpec))
+        simStatusMsg = ("|cffffd100Cleared imported sims for %s.|r"):format(SpecLabel(targetSpec))
         WipeLootPool()
         RefreshEJ()
         RefreshEJStrip()
         if RefreshWindow then RefreshWindow() end
-    end, nil, 180)
+    end, nil, 210)
     AT.RowToggle(sims, "Show EV as percent",
         function() return char.settings.evPercent end,
         function(v) char.settings.evPercent = v; RefreshEJ() end,
         nil,
         "Raidbots' Relative DPS view: gains and roll EVs show as a percent of your simmed DPS instead of raw numbers.")
-    AT.Section(sims, "Imported Data")
+    -- collapsible + self-cleaning: one row per difficulty that HAS a sim,
+    -- every empty one folded into a single dim line - nobody needs six
+    -- "no sim imported" rows for content they ignore (Arc's call). Starts
+    -- shut on first sight; the user's open/shut choice sticks after that.
+    char.settings.secCollapsed = char.settings.secCollapsed or {}
+    if char.settings.simDataSeeded == nil then
+        char.settings.simDataSeeded = true
+        char.settings.secCollapsed["Imported Data"] = true
+    end
+    AT.Section(sims, "Imported Data", { collapsible = true, store = char.settings })
     StatusRow(sims, function()
         return ("For |cff3fc9f2%s|r:"):format(CurrentSpecName())
     end)
-    for _, d in ipairs({ 17, 14, 15, 16 }) do
+    local DIFF_LABEL = {
+        [17] = "Raid Finder drops",
+        [14] = "Raid Normal drops",
+        [15] = "Raid Heroic drops",
+        [16] = "Raid Mythic drops",
+        vault17 = "Raid Finder bonus rolls",
+        vault14 = "Raid Normal bonus rolls",
+        vault15 = "Raid Heroic bonus rolls",
+        vault16 = "Raid Mythic bonus rolls",
+        mplus = "Mythic+ run drops",
+        mplusBonus = "Mythic+ bonus rolls",
+    }
+    local DIFF_ROWS = { 17, 14, 15, 16,
+        "vault17", "vault14", "vault15", "vault16", "mplus", "mplusBonus" }
+    for _, d in ipairs(DIFF_ROWS) do
         StatusRow(sims, function()
             local ev = simStore[d]
-            if not ev then
-                return ("%s: |cff8ca0b8no sim imported|r"):format(DifficultyName(d))
-            end
+            if not ev then return "" end
             local n = 0
             for _, encGains in pairs(ev.gains) do
                 for _ in pairs(encGains) do n = n + 1 end
             end
             return ("%s: |cffffd100%d|r item gains, imported %s"):format(
-                DifficultyName(d), n, date("%m-%d %H:%M", ev.t or 0))
-        end)
+                DIFF_LABEL[d] or DifficultyName(d), n, date("%m-%d %H:%M", ev.t or 0))
+        end, nil, function() return simStore[d] ~= nil end)
     end
+    StatusRow(sims, function()
+        local missing
+        for _, d in ipairs(DIFF_ROWS) do
+            if not simStore[d] then
+                local nm = DIFF_LABEL[d] or DifficultyName(d)
+                missing = missing and (missing .. ", " .. nm) or nm
+            end
+        end
+        return missing and ("|cff8ca0b8No sims for: %s|r"):format(missing) or ""
+    end, nil, function()
+        for _, d in ipairs(DIFF_ROWS) do
+            if not simStore[d] then return true end
+        end
+        return false
+    end)
 
     -- row-engine pages lay out twice: the synchronous pass on a chip click
     -- can run before font widths settle, which blanked the toggle labels -
@@ -2611,9 +4030,9 @@ local function EnsureWindow()
         pg:SetPoint("TOPLEFT", 10, -61)
         pg:SetPoint("BOTTOMRIGHT", -10, 40)
     end
-    AT.AddTabs(win, { "Overview", "Protection", "Journal", "Sims", "History" }, pages)
-    AT.AddDiscordFooter(win, "ArcBonusRollDiscordCopy")
-    win.SelectTab("Overview")
+    AT.AddTabs(win, { "Bonus Roll Overview", "Drops Overview", "Protection", "Overlays", "Sim Import", "History" }, pages)
+    AT.AddDiscordFooter(win, "ArcLootPlannerDiscordCopy")
+    win.SelectTab("Bonus Roll Overview")
     win:Hide()
     return win
 end
@@ -2626,7 +4045,7 @@ local function ToggleWindow()
     local w = EnsureWindow()
     if w:IsShown() then w:Hide() return end
     w:Show()
-    w.SelectTab(w._activeTab or "Overview")
+    w.SelectTab(w._activeTab or "Bonus Roll Overview")
     -- settle relayout: first-open runs before rects and font widths land
     C_Timer.After(0, RefreshWindow)
 end
@@ -2643,7 +4062,7 @@ end
 
 local function BuildMinimapButton()
     if mmBtn then return mmBtn end
-    mmBtn = CreateFrame("Button", "ArcBonusRollMinimapButton", Minimap)
+    mmBtn = CreateFrame("Button", "ArcLootPlannerMinimapButton", Minimap)
     mmBtn:SetSize(31, 31)
     mmBtn:SetFrameStrata("MEDIUM")
     mmBtn:SetFrameLevel(8)
@@ -2662,10 +4081,11 @@ local function BuildMinimapButton()
     bg:SetPoint("TOPLEFT", 7, -5)
     local icon = mmBtn:CreateTexture(nil, "ARTWORK")
     icon:SetSize(19, 19)
-    -- the coin currency's own art; it is square and the ring is round, so
-    -- mask the corners off with the portrait alpha circle
-    icon:SetTexture(CoinIconTexture())
-    icon:SetPoint("TOPLEFT", 6, -5)
+    -- the chest logo (glow-keyed); the ring is round, so mask the corners
+    -- off with the portrait alpha circle
+    icon:SetTexture(ROLL_BADGE_ICON)
+    -- dead-center on the background disc (a TOPLEFT offset sat 1.5px left)
+    icon:SetPoint("CENTER", bg, "CENTER", 0, 0)
     local mask = mmBtn:CreateMaskTexture()
     mask:SetTexture("Interface\\CharacterFrame\\TempPortraitAlphaMask",
         "CLAMPTOBLACKADDITIVE", "CLAMPTOBLACKADDITIVE")
@@ -2686,7 +4106,7 @@ local function BuildMinimapButton()
     mmBtn:SetScript("OnClick", function() ToggleWindow() end)
     mmBtn:SetScript("OnEnter", function(self)
         GameTooltip:SetOwner(self, "ANCHOR_LEFT")
-        GameTooltip:AddLine("|cff3fc9f2Arc|r|cffd5e2f2 Bonus Roll|r")
+        GameTooltip:AddLine("|cff3fc9f2Arc|r|cffd5e2f2 Loot Planner|r")
         local count = BonusRollsAvailable()
         if count then GameTooltip:AddLine(("Bonus rolls: %d"):format(count), 1, 0.82, 0) end
         GameTooltip:AddLine("Click: open.  Drag: move this button.", 0.8, 0.8, 0.8)
@@ -2700,7 +4120,7 @@ end
 
 ApplyMinimapButton = function()
     if not mmBtn then return end
-    mmBtn.icon:SetTexture(CoinIconTexture())
+    mmBtn.icon:SetTexture(ROLL_BADGE_ICON)
     mmBtn:SetShown(char and char.settings.minimap ~= false)
     MMUpdatePos()
 end
@@ -2726,7 +4146,7 @@ end
 
 local function BuildPlanPopup()
     if planPopup then return planPopup end
-    planPopup = CreateFrame("Frame", "ArcBonusRollPlanReminder", UIParent, "BackdropTemplate")
+    planPopup = CreateFrame("Frame", "ArcLootPlannerPlanReminder", UIParent, "BackdropTemplate")
     planPopup:SetSize(400, 104)
     planPopup:SetPoint("TOP", 0, -160)
     planPopup:SetFrameStrata("DIALOG")
@@ -2735,7 +4155,7 @@ local function BuildPlanPopup()
     local title = planPopup:CreateFontString(nil, "OVERLAY")
     title:SetFont(STANDARD_TEXT_FONT, 12, "")
     title:SetPoint("TOPLEFT", 12, -10)
-    title:SetText("|cff3fc9f2Arc|r|cffd5e2f2 Bonus Roll|r")
+    title:SetText("|cff3fc9f2Arc|r|cffd5e2f2 Loot Planner|r")
     local body = planPopup:CreateFontString(nil, "OVERLAY")
     body:SetFont(STANDARD_TEXT_FONT, 11, "")
     body:SetPoint("TOPLEFT", 12, -30)
@@ -2750,7 +4170,7 @@ local function BuildPlanPopup()
         planPopup:Hide()
         local w = EnsureWindow()
         if not w:IsShown() then w:Show() end
-        w.SelectTab("Overview")
+        w.SelectTab("Bonus Roll Overview")
         C_Timer.After(0, RefreshWindow)
     end)
     local skipBtn = AT.MakeSmallButton(planPopup, "Not this week", 110)
@@ -2813,7 +4233,7 @@ MaybePlanReminder = function(kind)
     planReminderSession = true
     BuildPlanPopup()
     if kind == "prompt" then
-        planPopup.body:SetText("A bonus roll is up but nothing is planned this week, so coin protection is not covering anything. Pick your bosses when you get a moment.")
+        planPopup.body:SetText("A bonus roll is up but nothing is planned this week, so bonus roll protection is not covering anything. Pick your bosses when you get a moment.")
     elseif kind == "coin" then
         planPopup.body:SetText("You just received a bonus roll coin and nothing is planned this week. Pick the bosses you want to spend it on.")
     elseif planned then
@@ -2906,10 +4326,8 @@ ev:SetScript("OnEvent", function(_, event, ...)
         BuildMinimapButton()
         loginAt = GetTime()
         -- confirm the coin pools in the background once the world settles,
-        -- and fill an empty sim bucket from WoWUtils (same as a spec swap)
         C_Timer.After(8, PrimePoolCache)
         C_Timer.After(10, function()
-            AutoImportSims()
             if RefreshWindow then RefreshWindow() end
             RefreshEJ()
             RefreshEJStrip()
@@ -2925,7 +4343,6 @@ ev:SetScript("OnEvent", function(_, event, ...)
         if char then
             RelinkSpecStores()
             WipeDetectCache()
-            AutoImportSims()
             WipeLootPool()
             RefreshEJ()
             RefreshEJStrip()
@@ -3033,12 +4450,12 @@ end
 -- /abr wipe: erase EVERYTHING saved (all characters, all specs, the
 -- account-wide pools) and reload = a true fresh-install state. Behind a
 -- confirm dialog: a typo must never nuke a real ledger.
-StaticPopupDialogs["ARCBONUSROLL_WIPE"] = {
-    text = "Arc Bonus Roll: erase ALL saved data (roll history, plans, owned marks, sims, pools - every character) and reload for a fresh-install state?",
+StaticPopupDialogs["ARCLOOTPLANNER_WIPE"] = {
+    text = "Arc Loot Planner: erase ALL saved data (roll history, plans, owned marks, sims, pools - every character) and reload for a fresh-install state?",
     button1 = YES,
     button2 = NO,
     OnAccept = function()
-        ArcBonusRollDB = nil   -- nil survives the reload's save = clean slate
+        ArcLootPlannerDB = nil   -- nil survives the reload's save = clean slate
         C_UI.Reload()
     end,
     timeout = 0,
@@ -3047,16 +4464,29 @@ StaticPopupDialogs["ARCBONUSROLL_WIPE"] = {
     preferredIndex = 3,
 }
 
-SLASH_ARCBONUSROLL1 = "/arcbonusroll"
-SLASH_ARCBONUSROLL2 = "/abr"
-SlashCmdList["ARCBONUSROLL"] = function(msg)
+SLASH_ARCLOOTPLANNER1 = "/arclootplanner"
+SLASH_ARCLOOTPLANNER2 = "/alp"
+SLASH_ARCLOOTPLANNER3 = "/abr"           -- legacy alias (pre-rename)
+SLASH_ARCLOOTPLANNER4 = "/arcbonusroll"  -- legacy alias (pre-rename)
+SlashCmdList["ARCLOOTPLANNER"] = function(msg)
     msg = (msg or ""):lower():match("^%s*(.-)%s*$")
     if msg == "wipe" then
-        StaticPopup_Show("ARCBONUSROLL_WIPE")
+        StaticPopup_Show("ARCLOOTPLANNER_WIPE")
         return
     end
     if msg == "mock" then
         ShowMock()
+        return
+    end
+    if msg == "lootroll force" then
+        lootRollForce = not lootRollForce
+        Print(lootRollForce
+            and "loot roll FORCE test ON: real roll windows show a fake +1,234 when no sim value exists. Resets on reload."
+            or "loot roll force test off.")
+        return
+    end
+    if msg == "lootroll" then
+        ToggleMockLootRoll()
         return
     end
     if msg == "test" then
@@ -3068,7 +4498,10 @@ SlashCmdList["ARCBONUSROLL"] = function(msg)
         return
     end
     if msg == "sim" then
-        ShowSimImport()
+        local w = EnsureWindow()
+        if not w:IsShown() then w:Show() end
+        w.SelectTab("Sim Import")
+        C_Timer.After(0, RefreshWindow)
         return
     end
     ToggleWindow()

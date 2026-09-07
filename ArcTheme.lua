@@ -181,10 +181,15 @@ function AT.MakeDropdown(owner, parent, w, itemsFn, get, set, onSelect)
     vf:SetFont(STANDARD_TEXT_FONT, 11, "")
     vf:SetPoint("LEFT", 8, 0); vf:SetPoint("RIGHT", -18, 0); vf:SetJustifyH("LEFT")
     vf:SetTextColor(COL.ink[1], COL.ink[2], COL.ink[3])
-    local arrow = b:CreateFontString(nil, "OVERLAY")
-    arrow:SetFont(STANDARD_TEXT_FONT, 9, "")
-    arrow:SetPoint("RIGHT", -6, -1)
-    arrow:SetTextColor(COL.arc[1], COL.arc[2], COL.arc[3]); arrow:SetText("v")
+    -- drawn chevron (two rotated bars, same as ArcSkin) - never a text "v" glyph
+    local arrow = CreateFrame("Frame", nil, b)
+    arrow:SetSize(12, 12); arrow:SetPoint("RIGHT", -5, 0)
+    local a1 = arrow:CreateTexture(nil, "OVERLAY")
+    a1:SetTexture(WHITE); a1:SetSize(7, 1.5); a1:SetPoint("CENTER", -2, 0.5)
+    a1:SetRotation(math.rad(-50)); a1:SetVertexColor(COL.arc[1], COL.arc[2], COL.arc[3], 1)
+    local a2 = arrow:CreateTexture(nil, "OVERLAY")
+    a2:SetTexture(WHITE); a2:SetSize(7, 1.5); a2:SetPoint("CENTER", 2, 0.5)
+    a2:SetRotation(math.rad(50)); a2:SetVertexColor(COL.arc[1], COL.arc[2], COL.arc[3], 1)
     b:SetScript("OnEnter", function() b:SetBackdropBorderColor(COL.arcDeep[1], COL.arcDeep[2], COL.arcDeep[3], 1) end)
     b:SetScript("OnLeave", function() b:SetBackdropBorderColor(COL.line[1], COL.line[2], COL.line[3], 1) end)
 
@@ -197,10 +202,38 @@ function AT.MakeDropdown(owner, parent, w, itemsFn, get, set, onSelect)
     end
     b.Refresh()
 
+    -- Auto width (w == nil): the field is exactly as long as the LONGEST
+    -- option name plus insets (8 text + 18 chevron), floored at 80 and
+    -- capped at 300 so a runaway name cannot eat the row. The pullout below
+    -- always copies the field width, so the two stay edge to edge. An
+    -- explicit w is honored untouched (hand-tuned call sites).
+    local function SizeToItems(items)
+        if w then return end
+        local fs = AT._measureFS
+        if not fs then
+            fs = UIParent:CreateFontString(nil, "ARTWORK")
+            fs:SetFont(STANDARD_TEXT_FONT, 11, ""); fs:Hide()
+            AT._measureFS = fs
+        end
+        local widest = 0
+        for _, it in ipairs(items or itemsFn() or {}) do
+            fs:SetText(it.text or "")
+            local tw = (fs.GetUnboundedStringWidth and fs:GetUnboundedStringWidth())
+                or fs:GetStringWidth() or 0
+            if tw > widest then widest = tw end
+        end
+        local want = math.floor(widest + 26 + 0.5)
+        if want < 80 then want = 80 end
+        if want > 300 then want = 300 end
+        b:SetWidth(want)
+    end
+    SizeToItems()
+
     b:SetScript("OnClick", function()
         if AT.openDropdown and AT.openDropdown._owner == b then AT.CloseDropdown() return end
         AT.CloseDropdown()
         local items = itemsFn() or {}
+        SizeToItems(items)
         local vis = math.min(#items, 12)
         local list = CreateFrame("Frame", nil, owner, "BackdropTemplate")
         list:SetFrameLevel(owner:GetFrameLevel() + 30)
@@ -651,7 +684,13 @@ function AT.LayoutPage(pg)
                     if r._colCtrl then
                         r._colCtrl:ClearAllPoints()
                         r._colCtrl:SetPoint("LEFT", r, "LEFT", col, 0)
-                        if r._colFill then r._colCtrl:SetPoint("RIGHT", r._colFill, "LEFT", -8, 0) end
+                        -- _colFill = true: fill to the ROW's right edge
+                        -- (inputs); a frame: stop at that frame (sliders)
+                        if r._colFill == true then
+                            r._colCtrl:SetPoint("RIGHT", r, "RIGHT", -12, 0)
+                        elseif r._colFill then
+                            r._colCtrl:SetPoint("RIGHT", r._colFill, "LEFT", -8, 0)
+                        end
                         if r._colLabel then r._colLabel:SetPoint("RIGHT", r, "LEFT", col - 6, 0) end
                     end
                 end
@@ -691,7 +730,11 @@ function AT.RowToggle(pg, label, get, set, visibleFn, desc)
     row:EnableMouse(true); row:SetScript("OnMouseUp", flip)
     row:HookScript("OnEnter", function() cb:SetHover(true) end)
     row:HookScript("OnLeave", function() cb:SetHover(false) end)
-    if desc then AT.Tooltip(row, label, desc) end
+    -- the checkbox is a child Button that EATS mouse events: hover glow and
+    -- tooltip must be hooked on it too, or the toggle itself is a dead zone
+    cb:HookScript("OnEnter", function() cb:SetHover(true) end)
+    cb:HookScript("OnLeave", function() cb:SetHover(false) end)
+    if desc then AT.Tooltip(row, label, desc); AT.Tooltip(cb, label, desc) end
     row._colLabel, row._colCtrl = lbl, cb
     row._sync = function() cb:SetOn(get()) end
     return row
@@ -700,7 +743,9 @@ end
 -- desc and hint may each be a string OR a function (live text). hint draws dim
 -- placeholder text INSIDE the box while empty: use it to show what is in effect
 -- without PRE-FILLING, which would turn "I left it alone" into a saved value.
-function AT.RowInput(pg, label, get, set, visibleFn, desc, hint)
+-- live = true commits on every USER keystroke/paste (not just focus lost), for
+-- fields that feed a derived row (e.g. a link the next row transforms).
+function AT.RowInput(pg, label, get, set, visibleFn, desc, hint, live)
     local row = AT.AddRow(pg, LAY.rowH, visibleFn)
     local lbl = AT.RowLabel(row, label)
     local box = CreateFrame("EditBox", nil, row, "BackdropTemplate")
@@ -722,7 +767,10 @@ function AT.RowInput(pg, label, get, set, visibleFn, desc, hint)
         hintFS:SetShown((box:GetText() or "") == "")
     end
     syncHint()
-    box:SetScript("OnTextChanged", syncHint)
+    box:SetScript("OnTextChanged", function(self, userInput)
+        syncHint()
+        if live and userInput then set(self:GetText() or "") end
+    end)
     -- the tooltip must be hooked on the BOX too: it is a child that eats mouse
     -- events, so a row-only hook shows nothing when you hover the field
     if desc then AT.Tooltip(row, label, desc); AT.Tooltip(box, label, desc) end
@@ -731,6 +779,9 @@ function AT.RowInput(pg, label, get, set, visibleFn, desc, hint)
     box:SetScript("OnEscapePressed", function() box:SetText(get() or ""); box:ClearFocus() end)
     box:SetScript("OnEditFocusGained", function() box:SetBackdropBorderColor(COL.arcDeep[1], COL.arcDeep[2], COL.arcDeep[3], 1) end)
     box:SetScript("OnEditFocusLost", function() commit(); box:SetBackdropBorderColor(COL.line[1], COL.line[2], COL.line[3], 1) end)
+    -- inputs sit on the measured control column like every other control,
+    -- and FILL from the column to the row's right edge (true = row fill)
+    row._colLabel, row._colCtrl, row._colFill = lbl, box, true
     row._sync = function()
         if not box:HasFocus() then box:SetText(get() or "") end
         syncHint()
@@ -741,7 +792,7 @@ end
 function AT.RowDropdown(pg, owner, label, get, set, itemsFn, visibleFn, onSelect)
     local row = AT.AddRow(pg, LAY.rowH, visibleFn)
     local lbl = AT.RowLabel(row, label)
-    local dd = AT.MakeDropdown(owner, row, LAY.fieldW, itemsFn, get, set, onSelect)
+    local dd = AT.MakeDropdown(owner, row, nil, itemsFn, get, set, onSelect)
     dd:SetPoint("LEFT", row._ctrlX, 0)
     row._colLabel, row._colCtrl = lbl, dd
     row._sync = dd.Refresh

@@ -1,0 +1,11 @@
+## Interface: 120100
+## Title: Arc Loot Planner
+## Notes: Your Droptimizer sims in-game: loot EV on the Adventure Guide, bonus roll planning and protection, Mythic+ pools, and a roll ledger. By the ArcUI author.
+## Author: Arc
+## Version: 1.0.0
+## IconTexture: Interface\AddOns\ArcLootPlanner\media\arc_chest
+## X-Curse-Project-ID: 1685408
+## SavedVariables: ArcLootPlannerDB
+
+ArcTheme.lua
+ArcLootPlanner.lua
