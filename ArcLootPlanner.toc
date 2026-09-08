@@ -5,6 +5,7 @@
 ## Version: 1.0.0
 ## IconTexture: Interface\AddOns\ArcLootPlanner\media\arc_chest
 ## X-Curse-Project-ID: 1685408
+## X-Wago-ID: QNlzXaKe
 ## SavedVariables: ArcLootPlannerDB
 
 ArcTheme.lua
