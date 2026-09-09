@@ -1,3 +1,11 @@
+## 1.0.1
+
+### Improvements
+
+- **Loot Database** — Now ships knowing every class and spec's loot for the current raids and Mythic+ season and keeps its lists fresh on its own — every page is full from the moment you install, the Mythic+ drops page works even without a sim, and old-content coins or slow loading can no longer leave the overview on the wrong raid or half-filled.
+- **Item Tooltips** — Tooltips show the real item at the right item level (sim-priced items at the exact level your sim used), items best used through the Catalyst are tagged with the set piece they become, and tooltips open at your cursor.
+- **Sim Import** — Smarter sims: healers can import QE Live Upgrade Finder reports, a sim finds its own character and spec on import, a drop and its Catalyst conversion count as one roll instead of two, and owned checks no longer trigger off an alt's lower-difficulty version.
+
 ## 1.0.0
 
 ### New Features

@@ -118,6 +118,61 @@ local function RelinkSpecStores()
     storesLinked = true
 end
 
+-- ── Shipped pool seed ───────────────────────────────────────────────────────
+-- NS.PoolSeed (the generated data file) carries every class and spec's
+-- loot tables, extracted once via TokenLab from the game's own journal
+-- database. At login the player's OWN class specs are expanded into the
+-- account pool store (presence only - never overwriting a link the
+-- primer has attached), so every page renders fully on the very first
+-- open. The background primer stays on as the verifier: it attaches
+-- real links and reconciles anything Blizzard changed.
+local function SeedPools()
+    local seed = NS.PoolSeed
+    if not (seed and type(seed.specs) == "table" and db) then return end
+    local classID = select(3, UnitClass("player"))
+    local getNum = C_SpecializationInfo and C_SpecializationInfo.GetNumSpecializationsForClassID
+        or GetNumSpecializationsForClassID
+    local getInfo = GetSpecializationInfoForClassID
+        or (C_SpecializationInfo and C_SpecializationInfo.GetSpecializationInfoForClassID)
+    local n = (classID and getNum) and getNum(classID) or 0
+    db.poolBySpec = db.poolBySpec or {}
+    for i = 1, n do
+        local specID = getInfo and getInfo(classID, i)
+        local sp = specID and seed.specs[specID]
+        if sp then
+            local store = db.poolBySpec[specID] or {}
+            db.poolBySpec[specID] = store
+            store.cache = store.cache or {}
+            local cache = store.cache
+            for _, d in ipairs({ 14, 15, 16, 17 }) do
+                local bucket = cache[d] or {}
+                cache[d] = bucket
+                for inst, encs in pairs(sp.r or {}) do
+                    for enc, ids in pairs(encs) do
+                        local set = bucket[enc] or {}
+                        bucket[enc] = set
+                        for id in ids:gmatch("%d+") do
+                            id = tonumber(id)
+                            if set[id] == nil then set[id] = true end
+                        end
+                    end
+                end
+            end
+            if type(sp.d) == "table" and next(sp.d) then
+                cache.mplusBonus = cache.mplusBonus or {}
+                for inst, ids in pairs(sp.d) do
+                    local set = cache.mplusBonus[inst] or {}
+                    cache.mplusBonus[inst] = set
+                    for id in ids:gmatch("%d+") do
+                        id = tonumber(id)
+                        if set[id] == nil then set[id] = true end
+                    end
+                end
+            end
+        end
+    end
+end
+
 local function InitDB()
     ArcLootPlannerDB = ArcLootPlannerDB or {}
     db = ArcLootPlannerDB
@@ -191,6 +246,7 @@ local function InitDB()
     -- ONCE, saved, and re-harvested only for a raid or spec this account
     -- has never confirmed. RelinkSpecStores aliases the live stores.
     RelinkSpecStores()
+    SeedPools()
 
     local cutoff = CurrentWeek() - 8 * 7 * 24 * 3600
     for week in pairs(char.plan) do
@@ -278,8 +334,16 @@ local function DetectOwnedByLink(link, itemID)
     local hit = detectCache[link]
     if hit ~= nil then return hit end
     local owned = false
-    if C_TransmogCollection and C_TransmogCollection.PlayerHasTransmogByItemInfo then
-        owned = C_TransmogCollection.PlayerHasTransmogByItemInfo(link) or false
+    -- transmog: SOURCE-level, never appearance-level. An alt's Normal copy
+    -- shares the appearance and false-marked the Heroic drop (user report:
+    -- Amani Summoning Shawl). PlayerKnowsSource answers for THIS
+    -- difficulty's version of the item only.
+    if C_TransmogCollection and C_TransmogCollection.GetItemInfo
+        and C_TransmogCollection.PlayerKnowsSource then
+        local _appearance, sourceID = C_TransmogCollection.GetItemInfo(link)
+        if sourceID then
+            owned = C_TransmogCollection.PlayerKnowsSource(sourceID) or false
+        end
     end
     if not owned and itemID then
         -- equipped/bags: match the item, and accept the drop's base item
@@ -290,12 +354,12 @@ local function DetectOwnedByLink(link, itemID)
         local function SameItem(foundLink)
             if not foundLink then return false end
             if ItemIDFromLink(foundLink) ~= itemID then return false end
-            -- same itemID = probably looted (the SimC approach); when both
-            -- item levels are readable, require the drop's base or higher
-            -- so a lower difficulty's copy does not claim this one
-            if not wantIlvl then return true end
+            -- STRICT on both ends (user report: a champion-track M+ copy
+            -- claimed the raid drop while item levels were unreadable):
+            -- when either item level cannot be read, claim NOTHING
+            if not wantIlvl then return false end
             local il = C_Item.GetDetailedItemLevelInfo(foundLink)
-            return il == nil or il >= wantIlvl
+            return il ~= nil and il >= wantIlvl
         end
         for slot = 1, 19 do
             if SameItem(GetInventoryItemLink("player", slot)) then
@@ -606,17 +670,185 @@ end
 -- gives per-item DPS gains keyed exactly like our journal markers.
 local DIFF_FROM_SOURCE = { normal = 14, heroic = 15, mythic = 16, lfr = 17 }
 
+-- slotless = a tier token / non-equipment journal item
+local function IsTokenItem(itemID)
+    if not itemID or not C_Item or not C_Item.GetItemInventoryTypeByID then return false end
+    local inv = C_Item.GetItemInventoryTypeByID(itemID)
+    return inv == (Enum.InventoryType and Enum.InventoryType.IndexNonEquipType or 0)
+end
+
+-- The season's OMNI token: the ONE tier token a bonus roll can never grant
+-- (Arc-confirmed in-game; the four slot tokens DO roll). Its gain still
+-- prices the DROPS surfaces like any token. Update per raid tier.
+-- TOKENS HAVE A DIFFERENT ITEM ID PER DIFFICULTY TRACK (live-confirmed:
+-- heroic Venomcast Icon 270928 vs the myth-track 268223 a Droptimizer
+-- sims). So live journal rows and sim rows NEVER share token ids - the
+-- design below is journal-first: the boss's token comes from the journal
+-- (right id for the shown difficulty), the sim only prices it.
+local OMNI_TOKENS = {
+    [271876] = true,   -- Venomous Abyss omni token, myth track (sim id)
+    [270909] = true,   -- Venomous Abyss omni token, heroic (live id)
+}
+
+-- TokenLab-proven (2026-09-08): the journal reports filterType 14 (Other)
+-- for EVERY token - slot tokens, the omni AND per-player items alike - so
+-- filterType can NOT identify or slot tokens. What IS reliable: the sim's
+-- vault rows carry the GENERATED PIECE directly (Arc's model), and those
+-- piece ids match C_LootJournal's set items exactly.
+-- Known token slots (Enum.ItemSlotFilterType values), for the old-import
+-- fallback where the gain was credited to a sim-side token id:
+local TOKEN_SLOTS = {
+    [268230] = 0,   -- head token (myth track / sim id)
+    [268231] = 2,   -- shoulder token (myth track / sim id)
+    [268223] = 4,   -- chest token (myth track / sim id)
+    [268238] = 6,   -- hands token (myth track / sim id)
+    [270928] = 4,   -- Venomcast Icon: chest token, heroic (live id)
+}
+
+local tokenPieceCache = {}   -- [specID] = { [tokenID] = pieceItemID | false }
+local tierPieceCache = {}    -- [classID*1000+specID] = { [itemID] = true }
+
+local function InvMatchesFilter(invType, ft)
+    local F, I = Enum.ItemSlotFilterType, Enum.InventoryType
+    if not (F and I) then return false end
+    if ft == F.Head then return invType == I.IndexHeadType + 1 end
+    if ft == F.Shoulder then return invType == I.IndexShoulderType + 1 end
+    if ft == F.Chest then
+        return invType == I.IndexChestType + 1 or invType == I.IndexRobeType + 1
+    end
+    if ft == F.Hand then return invType == I.IndexHandType + 1 end
+    if ft == F.Legs then return invType == I.IndexLegsType + 1 end
+    return false
+end
+
+-- every set-piece item id C_LootJournal knows for this class/spec, ALL
+-- sets unioned. TokenLab proved (a) these ids match the sim's tier rows
+-- EXACTLY, and (b) newest-by-itemLevel picks a non-tier armor set - so
+-- membership across every set is the safe test (sims only carry the
+-- current raid's pieces anyway).
+local function TierPieceSet()
+    local classID = select(3, UnitClass("player"))
+    local specID = CurrentSpecID()
+    if not (classID and specID) then return nil end
+    local key = classID * 1000 + specID
+    local cached = tierPieceCache[key]
+    if cached then return cached end
+    if not (C_LootJournal and C_LootJournal.GetItemSets
+        and C_LootJournal.GetItemSetItems) then return nil end
+    local sets = C_LootJournal.GetItemSets(classID, specID)
+    if not sets or #sets == 0 then return nil end     -- data not ready: no cache
+    -- TIER-SHAPED sets only: every piece in a tier slot (head, shoulder,
+    -- chest/robe, hands, legs). Armor sets carry wrist/waist/feet and must
+    -- NOT leak in - their pieces are REGULAR boss drops, and unioning them
+    -- re-added pool items as fake token outcomes (Arc's duplicate rows).
+    local I = Enum.InventoryType
+    local tierInv = I and {
+        [I.IndexHeadType + 1] = true, [I.IndexShoulderType + 1] = true,
+        [I.IndexChestType + 1] = true, [I.IndexRobeType + 1] = true,
+        [I.IndexHandType + 1] = true, [I.IndexLegsType + 1] = true,
+    } or nil
+    if not tierInv then return nil end
+    local out, any = {}, false
+    for _i, s in ipairs(sets) do
+        local items = C_LootJournal.GetItemSetItems(s.setID) or {}
+        local tierShaped = #items > 0
+        for _j, it in ipairs(items) do
+            if not tierInv[it.invType] then
+                tierShaped = false
+                break
+            end
+        end
+        if tierShaped then
+            for _j, it in ipairs(items) do
+                out[it.itemID] = true
+                any = true
+            end
+        end
+    end
+    if not any then return nil end
+    tierPieceCache[key] = out
+    return out
+end
+
+local function TokenPieceFor(tokenID)
+    local specID = CurrentSpecID()
+    local ft = TOKEN_SLOTS[tokenID]
+    if ft == nil then ft = db and db.tokenSlots and db.tokenSlots[tokenID] end
+    if not specID or ft == nil then return nil end
+    local perSpec = tokenPieceCache[specID]
+    if perSpec and perSpec[tokenID] ~= nil then return perSpec[tokenID] or nil end
+    local classID = select(3, UnitClass("player"))
+    if not (classID and C_LootJournal and C_LootJournal.GetItemSets
+        and C_LootJournal.GetItemSetItems) then return nil end
+    local sets = C_LootJournal.GetItemSets(classID, specID)
+    if not sets or #sets == 0 then return nil end     -- data not ready: no cache
+    -- highest setID with a slot match: set ids grow with releases, and the
+    -- TokenLab dump proved itemLevel ranking picks a non-tier armor set
+    local piece, bestSet = false, -1
+    for _i, s in ipairs(sets) do
+        if (s.setID or 0) > bestSet then
+            for _j, it in ipairs(C_LootJournal.GetItemSetItems(s.setID) or {}) do
+                if InvMatchesFilter(it.invType, ft) then
+                    piece, bestSet = it.itemID, s.setID
+                    break
+                end
+            end
+        end
+    end
+    tokenPieceCache[specID] = tokenPieceCache[specID] or {}
+    tokenPieceCache[specID][tokenID] = piece
+    return piece or nil
+end
+
+-- THE boss token outcome (Arc's model, TokenLab-proven): the boss's set
+-- token becomes ONE specific piece for your class/spec, and the SIM's
+-- vault rows already carry that PIECE as a plain gains entry - the
+-- journal pool just never lists it (the boss drops the slotless token),
+-- which is what kept it out of the roll surfaces. Primary: the best
+-- tier-set-piece key in gains (ids match C_LootJournal exactly).
+-- Fallback for OLD imports whose parser credited the gain to the sim's
+-- token id: map that token to the piece. The omni never rolls (its rows
+-- are dropped at parse; old omni-credited entries are skipped here).
+-- Returns piece, gain, owned, ownedSource, inGains (piece key present in
+-- gains - the no-cache listings already show those as plain rows).
+local function GetBossTokenOutcome(enc, simKey, ownedDiff)
+    local ev = char and simStore[simKey]
+    local gains = ev and ev.gains and ev.gains[enc]
+    if not gains then return nil end
+    local pieces = TierPieceSet()
+    local piece, gain, tokenID
+    for id, g in pairs(gains) do
+        if pieces and pieces[id] then
+            if not gain or g > gain then piece, gain = id, g end
+        elseif IsTokenItem(id) and not OMNI_TOKENS[id] then
+            tokenID = id
+        end
+    end
+    if not piece and tokenID then
+        gain = gains[tokenID]
+        piece = TokenPieceFor(tokenID) or tokenID
+    end
+    if not piece then return nil end
+    local owned, source = IsOwnedItem(piece, ownedDiff)
+    if not owned and tokenID then owned, source = IsOwnedItem(tokenID, ownedDiff) end
+    return piece, gain, owned, source, (gains[piece] ~= nil)
+end
+
 local function ParseDroptimizerCSV(text)
     if type(text) ~= "string" or text == "" then return nil end
-    local baseline
+    local baseline, actorName
     local rows = {}
     for line in text:gmatch("[^\r\n]+") do
         local name, mean = line:match("^([^,]+),([%d%.]+)")
         local meanN = mean and tonumber(mean) or nil
         if name and meanN then
             if not name:find("/") then
-                -- the first non-profileset numeric row is the baseline actor
-                if not baseline then baseline = meanN end
+                -- the first non-profileset numeric row is the baseline
+                -- actor - its NAME is the simmed character
+                if not baseline then
+                    baseline = meanN
+                    actorName = name
+                end
             else
                 local f = {}
                 for part in (name .. "/"):gmatch("([^/]*)/") do f[#f + 1] = part end
@@ -631,14 +863,46 @@ local function ParseDroptimizerCSV(text)
                     -- credit the gain to the item that actually drops,
                     -- so the journal row shows its best use
                     local enc = tonumber(f[2])
-                    local item = tonumber(f[11]) or tonumber(f[4])
+                    local tokenID = tonumber(f[11])
+                    local isVault = src:find("vault") ~= nil
+                    -- "raid-vault-*" rows are the BONUS ROLL track and get
+                    -- their own bucket. VAULT conversion rows keep the
+                    -- GENERATED PIECE as the key (Arc's model: the coin
+                    -- grants the piece; the piece ids match C_LootJournal),
+                    -- and omni conversions are dropped - the omni never
+                    -- rolls. DROPS rows keep crediting the token: the
+                    -- guide's token row is what gets priced there.
+                    local item
+                    if isVault then
+                        -- (plain if, NOT `and nil or`: that idiom always
+                        -- falls through to the or-branch)
+                        if tokenID and OMNI_TOKENS[tokenID] then
+                            -- omni conversion: the omni never rolls
+                        elseif tokenID and not IsTokenItem(tokenID) then
+                            -- CATALYST conversion of a REAL drop (the source
+                            -- has an equip slot): the coin grants the SOURCE
+                            -- item, catalyzing is the player's later choice -
+                            -- credit the source so one drop is ONE row at its
+                            -- best use (Arc's Soulslither/Hissing Mantle
+                            -- double-count)
+                            item = tokenID
+                        else
+                            -- true slotless TOKEN (or a plain row): the coin
+                            -- grants token -> piece; key the piece
+                            item = tonumber(f[4])
+                        end
+                    else
+                        item = tokenID or tonumber(f[4])
+                    end
                     if diff and enc and item then
-                        -- "raid-vault-*" rows are the BONUS ROLL track (a
-                        -- higher item level than the kill drop): they get
-                        -- their own bucket so a drops sim and a bonus roll
-                        -- sim never overwrite each other
-                        local key = src:find("vault") and ("vault" .. diff) or diff
-                        rows[#rows + 1] = { diff = key, enc = enc, item = item, mean = meanN }
+                        local key = isVault and ("vault" .. diff) or diff
+                        -- when the credited item differs from the simmed
+                        -- piece, this row is a CONVERSION - remember what
+                        -- the drop becomes (catalyst piece / token piece)
+                        local simmed = tonumber(f[4])
+                        rows[#rows + 1] = { diff = key, enc = enc, item = item, mean = meanN,
+                                            lv = tonumber(f[5]),
+                                            conv = (simmed and simmed ~= item) and simmed or nil }
                     end
                 elseif src:find("dungeon") then
                     -- Dungeon rows carry no per-boss identity (the leading IDs
@@ -656,7 +920,10 @@ local function ParseDroptimizerCSV(text)
                     if not enc or enc <= 0 then enc = -1 end
                     local item = tonumber(f[11]) or tonumber(f[4])
                     if item then
-                        rows[#rows + 1] = { diff = diff, enc = enc, item = item, mean = meanN }
+                        local simmed = tonumber(f[4])
+                        rows[#rows + 1] = { diff = diff, enc = enc, item = item, mean = meanN,
+                                            lv = tonumber(f[5]),
+                                            conv = (simmed and simmed ~= item) and simmed or nil }
                     end
                 end
             end
@@ -664,16 +931,38 @@ local function ParseDroptimizerCSV(text)
     end
     if not baseline or #rows == 0 then return nil end
     -- an item can be simmed several ways (trinket1/trinket2, ring slots,
-    -- tier pairings): keep the BEST gain per (difficulty, boss, item)
-    local out = {}
+    -- tier pairings): keep the BEST gain per (difficulty, boss, item).
+    -- The SIMMED ITEM LEVEL rides along per bucket (highest wins): the
+    -- tooltip says what level the sim actually priced, since a bare
+    -- itemID tooltip can only preview the base version.
+    local out, lvOut, convOut, plainOut = {}, {}, {}, {}
     for _, r in ipairs(rows) do
         local gain = r.mean - baseline
         out[r.diff] = out[r.diff] or {}
         out[r.diff][r.enc] = out[r.diff][r.enc] or {}
         local cur = out[r.diff][r.enc][r.item]
-        if not cur or gain > cur then out[r.diff][r.enc][r.item] = gain end
+        if not cur or gain > cur then
+            out[r.diff][r.enc][r.item] = gain
+            -- the WINNING row decides the story: a conversion row winning
+            -- means "this drop is best used as <piece>"; an as-is row
+            -- winning clears it
+            convOut[r.diff] = convOut[r.diff] or {}
+            convOut[r.diff][r.item] = r.conv or nil
+        end
+        -- keep the best AS-DROPPED gain separately: when the catalyzed
+        -- use wins, the tooltip shows both numbers side by side
+        if not r.conv then
+            plainOut[r.diff] = plainOut[r.diff] or {}
+            local cp = plainOut[r.diff][r.item]
+            if not cp or gain > cp then plainOut[r.diff][r.item] = gain end
+        end
+        if r.lv then
+            lvOut[r.diff] = lvOut[r.diff] or {}
+            local clv = lvOut[r.diff][r.item]
+            if not clv or r.lv > clv then lvOut[r.diff][r.item] = r.lv end
+        end
     end
-    return baseline, out
+    return baseline, out, lvOut, actorName, convOut, plainOut
 end
 
 -- ── Cross-character sim import ──────────────────────────────────────────────
@@ -709,22 +998,237 @@ local function SimBucketFor(charKey, specID)
     return c.specData[specID].simEV
 end
 
--- returns: importedDiffCount, itemCount (nil = parse failed)
-local function ApplySimImport(text, bucket)
+-- ── QE Live upgrade report paste (healers) ──────────────────────────────────
+-- questionablyepic.com/live/upgradereport/<id> has a public raw endpoint:
+--   https://questionablyepic.com/api/getUpgradeReport.php?reportID=<id>
+-- The JSON is double-encoded, and entries carry NO boss ids (QE resolves
+-- those client-side) - bosses are attributed through OUR pool caches.
+-- Entry shape (verified against two live reports):
+--   {"item":268196,"dropLoc":"Raid","dropType":"bonus","dropDifficulty":2,
+--    "level":334,...,"rawDiff":1043,"percDiff":0.298}
+--   dropLoc  Raid | Dungeon | Crafted | Delves
+--   dropType drop (base track) | max (6/6 projection, skipped) | bonus
+--   dropDifficulty (raid) = QE's own enum, 0 LFR / 1 Normal / 2 Heroic /
+--   3 Mythic (their source: ["Raid Finder","Normal","Heroic","Mythic"]);
+--   for dungeons it is the M+ key level.
+-- Gains = percDiff -> percent-native buckets, like the WoWUtils QE path.
+local QE_RAID_DIFF = { [0] = 17, [1] = 14, [2] = 15, [3] = 16 }
+
+local function ParseQEReport(text)
+    if type(text) ~= "string" then return nil end
+    if not (text:find("dropLoc") and text:find("percDiff")) then return nil end
+    local s = text:gsub('\\"', '"')   -- the raw endpoint serves it double-encoded
+    -- report identity: QE stamps the owner's spec and name in the header
+    local repSpec = s:match('"spec":"([^"]+)"')
+    local repPlayer = s:match('"playername":"([^"]+)"')
+    local buckets = {}
+    local lvs = {}
+    local placed = 0
+    local entryLv
+    local function put(diffKey, enc, itemID, perc)
+        buckets[diffKey] = buckets[diffKey] or {}
+        buckets[diffKey][enc] = buckets[diffKey][enc] or {}
+        local cur = buckets[diffKey][enc][itemID]
+        if not cur or perc > cur then buckets[diffKey][enc][itemID] = perc end
+        if entryLv then
+            lvs[diffKey] = lvs[diffKey] or {}
+            local clv = lvs[diffKey][itemID]
+            if not clv or entryLv > clv then lvs[diffKey][itemID] = entryLv end
+        end
+        placed = placed + 1
+    end
+    for entry in s:gmatch("%{(.-)%}") do
+        local itemID = tonumber(entry:match('"item":(%d+)'))
+        local loc = entry:match('"dropLoc":"(%a+)"')
+        local typ = entry:match('"dropType":"(%a+)"')
+        local dd = tonumber(entry:match('"dropDifficulty":(%d+)') or "")
+        local perc = tonumber(entry:match('"percDiff":([%-%d%.eE]+)') or "")
+        entryLv = tonumber(entry:match('"level":(%d+)') or "")
+        if itemID and loc and typ and perc then
+            if loc == "Raid" and (typ == "drop" or typ == "bonus") and QE_RAID_DIFF[dd] then
+                local diff = QE_RAID_DIFF[dd]
+                -- boss attribution through the journal pool cache (the
+                -- background primer keeps it filled); items the pool does
+                -- not know - tokens included - are skipped
+                local enc
+                local pools = poolStore[diff]
+                if pools then
+                    for e, set in pairs(pools) do
+                        if set[itemID] then enc = e break end
+                    end
+                end
+                if enc then
+                    put(typ == "bonus" and ("vault" .. diff) or diff, enc, itemID, perc)
+                end
+            elseif loc == "Dungeon" and typ == "drop" then
+                put("mplus", -1, itemID, perc)
+            elseif loc == "Dungeon" and typ == "bonus" then
+                local inst
+                if poolStore.mplusBonus then
+                    for id, set in pairs(poolStore.mplusBonus) do
+                        if set[itemID] then inst = id break end
+                    end
+                end
+                if inst then put("mplusBonus", inst, itemID, perc) end
+            end
+            -- "max" rows (6/6 projections) and Crafted/Delves are not drops
+        end
+    end
+    if placed == 0 then return nil end
+    return buckets, lvs, repSpec, repPlayer
+end
+
+-- QE reports stamp the owner's spec ("Restoration Druid"). Resolve that
+-- string against the client's own class/spec roster - the class token
+-- disambiguates the two Restorations. Localized names, so a non-matching
+-- locale simply resolves nothing and stays permissive.
+local function ResolveSpecFromQEString(str)
+    if type(str) ~= "string" or str == "" then return nil end
+    local needle = str:lower()
+    local getNum = C_SpecializationInfo and C_SpecializationInfo.GetNumSpecializationsForClassID
+        or GetNumSpecializationsForClassID
+    local getInfo = GetSpecializationInfoForClassID
+        or (C_SpecializationInfo and C_SpecializationInfo.GetSpecializationInfoForClassID)
+    if not (getNum and getInfo) then return nil end
+    for classID = 1, (GetNumClasses and GetNumClasses() or 13) do
+        local ci = C_CreatureInfo and C_CreatureInfo.GetClassInfo
+            and C_CreatureInfo.GetClassInfo(classID)
+        local className = ci and ci.className
+        if className and needle:find(className:lower(), 1, true) then
+            for i = 1, getNum(classID) or 0 do
+                local id, name = getInfo(classID, i)
+                if id and name and needle:find(name:lower(), 1, true) then
+                    return id
+                end
+            end
+        end
+    end
+    return nil
+end
+
+-- The seed's per-spec loot sets double as a SPEC FINGERPRINT: a
+-- Droptimizer CSV carries no spec identity, but its item list IS the
+-- spec's eligible loot - overlapping it against each seed spec of the
+-- class identifies which spec was simmed. Confident only on a strict
+-- lead, so near-identical loot lists (ele vs resto) resolve to nil and
+-- fall back to the chosen target instead of guessing.
+local specSeedSets
+local function SeedSetFor(specID)
+    local seed = NS.PoolSeed
+    local sp = seed and seed.specs and seed.specs[specID]
+    if not sp then return nil end
+    specSeedSets = specSeedSets or {}
+    local set = specSeedSets[specID]
+    if set then return set end
+    set = {}
+    for _, encs in pairs(sp.r or {}) do
+        for _, ids in pairs(encs) do
+            for id in ids:gmatch("%d+") do set[tonumber(id)] = true end
+        end
+    end
+    for _, ids in pairs(sp.d or {}) do
+        for id in ids:gmatch("%d+") do set[tonumber(id)] = true end
+    end
+    specSeedSets[specID] = set
+    return set
+end
+
+local function DetectSpecFromSimItems(byDiff, classID)
+    if not (classID and NS.PoolSeed and byDiff) then return nil end
+    local items = {}
+    for _, encs in pairs(byDiff) do
+        for _, gains in pairs(encs) do
+            for itemID in pairs(gains) do items[itemID] = true end
+        end
+    end
+    local getNum = C_SpecializationInfo and C_SpecializationInfo.GetNumSpecializationsForClassID
+        or GetNumSpecializationsForClassID
+    local getInfo = GetSpecializationInfoForClassID
+        or (C_SpecializationInfo and C_SpecializationInfo.GetSpecializationInfoForClassID)
+    if not (getNum and getInfo) then return nil end
+    local best, bestHits, secondHits
+    for i = 1, getNum(classID) or 0 do
+        local specID = getInfo(classID, i)
+        local set = specID and SeedSetFor(specID)
+        if set then
+            local hits = 0
+            for itemID in pairs(items) do
+                if set[itemID] then hits = hits + 1 end
+            end
+            if not bestHits or hits > bestHits then
+                secondHits = bestHits
+                best, bestHits = specID, hits
+            elseif not secondHits or hits > secondHits then
+                secondHits = hits
+            end
+        end
+    end
+    if best and bestHits >= 8 and bestHits > (secondHits or 0) then
+        return best
+    end
+    return nil
+end
+
+-- returns: importedDiffCount, itemCount, err, usedSpec. The sim decides
+-- where it lands: a sim for another CHARACTER is refused by name; a sim
+-- for another SPEC of the target character is routed into that spec's
+-- bucket (CSV: seed fingerprint; QE: the report's own spec stamp).
+local function ApplySimImport(text, bucket, targetSpec, targetName, targetClassID, bucketForSpec)
     if not storesLinked then RelinkSpecStores() end
     if not char then return nil end
     bucket = bucket or simStore
-    local baseline, byDiff = ParseDroptimizerCSV(text)
-    if not baseline then return nil end
+    local baseline, byDiff, byLv, actorName, byConv, byPlain = ParseDroptimizerCSV(text)
+    if not baseline then
+        -- QE Live upgrade report (healers): percent-native buckets
+        local qe, qeLv, repSpec, repPlayer = ParseQEReport(text)
+        if qe then
+            -- another character's report poisons the buckets - refuse
+            if repPlayer and targetName and repPlayer:lower() ~= targetName:lower() then
+                return nil, nil, ("This QE report belongs to %s (%s) - not to %s. Import it on that character."):format(
+                    repPlayer, repSpec or "?", targetName)
+            end
+            -- same character, another spec: the report says which - route it
+            local usedSpec = targetSpec
+            local repID = ResolveSpecFromQEString(repSpec)
+            if repID and targetSpec and repID ~= targetSpec and bucketForSpec then
+                bucket = bucketForSpec(repID)
+                usedSpec = repID
+            end
+            local diffs, items = 0, 0
+            for diff, gains in pairs(qe) do
+                bucket[diff] = { base = nil, t = time(), gains = gains, pct = true,
+                                 lv = qeLv and qeLv[diff] or nil }
+                diffs = diffs + 1
+                for _, eg in pairs(gains) do
+                    for _ in pairs(eg) do items = items + 1 end
+                end
+            end
+            return diffs, items, nil, usedSpec
+        end
+        return nil
+    end
+    if actorName and targetName and actorName:lower() ~= targetName:lower() then
+        return nil, nil, ("This sim is for %s - not for %s. Import it on that character."):format(
+            actorName, targetName)
+    end
+    local usedSpec = targetSpec
+    local det = DetectSpecFromSimItems(byDiff, targetClassID)
+    if det and targetSpec and det ~= targetSpec and bucketForSpec then
+        bucket = bucketForSpec(det)
+        usedSpec = det
+    end
     local diffs, items = 0, 0
     for diff, gains in pairs(byDiff) do
-        bucket[diff] = { base = baseline, t = time(), gains = gains }
+        bucket[diff] = { base = baseline, t = time(), gains = gains,
+                         lv = byLv and byLv[diff] or nil,
+                         cv = byConv and byConv[diff] or nil,
+                         ca = byPlain and byPlain[diff] or nil }
         diffs = diffs + 1
         for _, encGains in pairs(gains) do
             for _ in pairs(encGains) do items = items + 1 end
         end
     end
-    return diffs, items
+    return diffs, items, nil, usedSpec
 end
 
 -- ZERO-PASTE import from the WoWUtils companion addon: it stores fully
@@ -768,10 +1272,13 @@ local function ImportFromWowUtils()
     if not sims then
         return nil, "WoWUtils has no sims stored for your current spec."
     end
-    -- pick the newest sim per difficulty
+    -- pick the newest sim per difficulty. Two sim types live here:
+    -- raidbots (absolute gains + baseline) and QE LIVE (healers: percent
+    -- gains in gainPercent, NO baseline - simType 2 in WoWUtils' enum).
     local newest = {}
     for _, sim in pairs(sims) do
-        if type(sim) == "table" and type(sim.items) == "table" and type(sim.baseline) == "number" then
+        if type(sim) == "table" and type(sim.items) == "table"
+            and (type(sim.baseline) == "number" or sim.simType == 2) then
             local diffsIn = {}
             for _, entries in pairs(sim.items) do
                 if type(entries) == "table" then
@@ -793,24 +1300,42 @@ local function ImportFromWowUtils()
     local diffs, items = 0, 0
     for d, sim in pairs(newest) do
         local gains = {}
+        local lvs = {}
         for itemId, entries in pairs(sim.items) do
             if type(entries) == "table" then
                 for _, e in ipairs(entries) do
-                    if e.difficultyId == d and type(e.gain) == "number" then
+                    -- raidbots entries carry `gain` (absolute DPS), QE Live
+                    -- entries carry `gainPercent` (healers) - accept either
+                    local g = (type(e.gain) == "number" and e.gain)
+                        or (type(e.gainPercent) == "number" and e.gainPercent) or nil
+                    if e.difficultyId == d and g then
                         local src = type(e.sourceItem) == "table" and e.sourceItem or nil
                         local enc = (src and src.encounterId) or e.encounterId
                         local dropItem = (src and src.itemId) or itemId
                         if type(enc) == "number" and enc > 0 and type(dropItem) == "number" then
                             gains[enc] = gains[enc] or {}
                             local cur = gains[enc][dropItem]
-                            if not cur or e.gain > cur then gains[enc][dropItem] = e.gain end
+                            if not cur or g > cur then gains[enc][dropItem] = g end
+                            -- field name varies by WoWUtils version; all guarded
+                            local elv = (type(e.itemLevel) == "number" and e.itemLevel)
+                                or (type(e.level) == "number" and e.level)
+                                or (type(e.ilvl) == "number" and e.ilvl) or nil
+                            if elv then
+                                local clv = lvs[dropItem]
+                                if not clv or elv > clv then lvs[dropItem] = elv end
+                            end
                         end
                     end
                 end
             end
         end
         if next(gains) then
-            simStore[d] = { base = sim.baseline, t = sim.simmedAt or time(), gains = gains }
+            -- QE Live buckets are percent-native: flag them so every
+            -- readout formats "+1.2%" (there is no raw DPS to show)
+            local isPct = (sim.simType == 2) or type(sim.baseline) ~= "number"
+            simStore[d] = { base = type(sim.baseline) == "number" and sim.baseline or nil,
+                            t = sim.simmedAt or time(), gains = gains, pct = isPct or nil,
+                            lv = next(lvs) and lvs or nil }
             diffs = diffs + 1
             for _, eg in pairs(gains) do
                 for _ in pairs(eg) do items = items + 1 end
@@ -840,12 +1365,6 @@ end
 -- "Use: create a set item" tokens). A simmed item at a boss that is NOT in
 -- the boss's visible pool is by definition such a conversion result - its
 -- best gain is the token's value.
-local function IsTokenItem(itemID)
-    if not itemID or not C_Item or not C_Item.GetItemInventoryTypeByID then return false end
-    local inv = C_Item.GetItemInventoryTypeByID(itemID)
-    return inv == (Enum.InventoryType and Enum.InventoryType.IndexNonEquipType or 0)
-end
-
 local function OrphanTokenGain(diff, enc, poolDiff, ownedDiff)
     local ev = char and simStore[diff]
     local gains = ev and ev.gains[enc]
@@ -891,11 +1410,9 @@ local function BossSimEV(enc, diff, ownedDiff, poolDiff)
     -- drops count as outcomes (sim-only phantoms are excluded); a pool
     -- item the sim did not value contributes 0 but still dilutes
     local cache = poolStore[poolDiff] and poolStore[poolDiff][enc]
+    local hadCache = cache and next(cache) ~= nil
     local sum, remaining = 0, 0
-    if cache and next(cache) then
-        -- pool items only: the bonus roll table carries NO tokens and no
-        -- conversion pieces (Arc's ruling) - token gains price the DROPS
-        -- surfaces, never the coin
+    if hadCache then
         for itemID in pairs(cache) do
             if not IsOwnedItem(itemID, ownedDiff) then
                 remaining = remaining + 1
@@ -905,11 +1422,26 @@ local function BossSimEV(enc, diff, ownedDiff, poolDiff)
         end
     else
         for itemID, g in pairs(gains) do
-            if not IsOwnedItem(itemID, ownedDiff) then
-                remaining = remaining + 1
-                if g > 0 then sum = sum + g end
+            -- token-credited entries are handled once below as the boss
+            -- token outcome; the omni never rolls at all
+            if not IsTokenItem(itemID) then
+                if not IsOwnedItem(itemID, ownedDiff) then
+                    remaining = remaining + 1
+                    if g > 0 then sum = sum + g end
+                end
             end
         end
+    end
+    -- THE BOSS TOKEN outcome joins the pool (Arc's correction): the tier
+    -- piece the coin can grant, which the journal pool never lists. In
+    -- the no-cache branch a piece-keyed entry was already counted above.
+    local piece, tGain, tOwned, _src, inGains = GetBossTokenOutcome(enc, diff, ownedDiff)
+    -- never double-count: a piece that IS a pool item (or already counted
+    -- from gains in the no-cache branch) is not an extra outcome
+    if piece and not tOwned
+        and ((hadCache and not cache[piece]) or (not hadCache and not inGains)) then
+        remaining = remaining + 1
+        if tGain and tGain > 0 then sum = sum + tGain end
     end
     if remaining > 0 and sum > 0 then
         return sum / remaining, remaining
@@ -934,6 +1466,12 @@ end
 
 -- "+3,478" or, in percent mode, "+1.9%" (Raidbots' Relative DPS view)
 local function FormatGainNumber(v, diff)
+    -- QE Live buckets (healers) are percent-native: always show percent,
+    -- there is no raw DPS number behind them
+    local ev = char and simStore[diff]
+    if ev and ev.pct then
+        return ("%+.1f%%"):format(v)
+    end
     if char and char.settings.evPercent then
         local base = SimBaseFor(diff)
         if base and base > 0 then
@@ -1072,12 +1610,20 @@ local function EnsureLootPool()
                     end
                 end
             else
-                for enc, set in pairs(fresh) do
-                    -- only replace a boss's cached pool with a COMPLETE view
-                    -- of it (the list always carries a boss's full table
-                    -- when the boss is present at all)
-                    poolStore[diffNow] = poolStore[diffNow] or {}
-                    poolStore[diffNow][enc] = set
+                -- CURRENT-raid pages only, raid difficulties only: browsing
+                -- an old raid (or an oddball difficulty) must never write
+                -- into the season pools - that is exactly how Kings' Rest
+                -- bosses and a difficulty-2 bucket ended up inside them
+                local viewInst = EJCurrentInstanceID()
+                if viewInst and db and viewInst == db.currentRaidInst
+                    and (diffNow == 14 or diffNow == 15 or diffNow == 16 or diffNow == 17) then
+                    for enc, set in pairs(fresh) do
+                        -- only replace a boss's cached pool with a COMPLETE
+                        -- view of it (the list always carries a boss's full
+                        -- table when the boss is present at all)
+                        poolStore[diffNow] = poolStore[diffNow] or {}
+                        poolStore[diffNow][enc] = set
+                    end
                 end
             end
         end
@@ -1406,27 +1952,47 @@ local function ItemMarkerUpdate(m)
             end
         end
         local bonusTxt = ""
-        -- token rows carry NO coin line and no share: tokens are not part
-        -- of the bonus roll table (Arc's ruling) - drop pricing only
-        if showShares and not slotless then
+        -- SLOT TOKEN rows wear the coin line too (Arc's in-game correction:
+        -- each token boss's roll can grant its one token; only the OMNI
+        -- never rolls, and it stays drop-priced only)
+        local bKeyRaid = (not dungeonMode) and RollSimKey(diff) or nil
+        -- a slot token IS a coin outcome. filterType is USELESS for this
+        -- (TokenLab: every token reports Other/14) - the live signal is
+        -- "slotless token, not per-player, not the omni"
+        local rollsToken = (slotless and IsTokenItem(btn.itemID)
+            and info and not info.displayAsPerPlayerLoot
+            and not OMNI_TOKENS[btn.itemID]) or false
+        if showShares and (not slotless or rollsToken) then
             local bGain, bKey
             if dungeonMode then
                 local instID = EJCurrentInstanceID()
                 bGain = instID and SimGainFor("mplusBonus", instID, btn.itemID) or nil
                 bKey = "mplusBonus"
             else
-                bKey = RollSimKey(diff)
+                bKey = bKeyRaid
                 -- only a real vault/bonus sim prices the coin part: the drop
                 -- sim's number must never wear the coin
                 if bKey ~= diff then bGain = SimGainFor(bKey, btn.encounterID, btn.itemID) end
+                if rollsToken and not bGain and bKey ~= diff and btn.encounterID then
+                    -- the token's value = the piece outcome's gain
+                    local _pc, g = GetBossTokenOutcome(btn.encounterID, bKey, diff)
+                    bGain = g
+                end
             end
             if bGain and (bGain >= 0.5 or bGain <= -0.5) then
                 local col = bGain >= 0.5 and "|cff4cde4c" or "|cff8ca0b8"
                 bonusTxt = ("%s%s|r"):format(col, FormatGainNumber(bGain, bKey))
             end
-            if remaining > 0 then
+            -- share: prefer the roll-EV remaining (it counts the token
+            -- outcomes too), fall back to the pool count when no sim
+            local shareDen = remaining
+            if not dungeonMode and btn.encounterID then
+                local _bev, rr = BossSimEV(btn.encounterID, bKey, diff, diff)
+                if rr and rr > 0 then shareDen = rr end
+            end
+            if shareDen > 0 then
                 bonusTxt = bonusTxt .. (bonusTxt ~= "" and " " or "")
-                    .. ("~%.0f%%"):format(100 / remaining)
+                    .. ("~%.0f%%"):format(100 / shareDen)
             end
         end
         -- fill the two column slots top-down: coin line first, bag line
@@ -2233,18 +2799,35 @@ end
 -- The season's current raid: the instance we last saw a roll prompt in,
 -- or the newest raid of the latest journal tier.
 local function GetCurrentRaidInstanceID()
-    local inst = char and char.lastInstanceID
-    if not inst and EJ_GetNumTiers and EJ_SelectTier and EJ_GetInstanceByIndex then
+    -- the newest tier's raids ARE the season; the last roll-prompt
+    -- instance is trusted only when it is one of them. A bonus roll in
+    -- OLD content (farming Kings' Rest) used to hijack the whole page to
+    -- that instance - TokenLab-proven: lastInstanceID=1041 put four
+    -- Kings' Rest bosses where the Venomous Abyss belonged.
+    local last = char and char.lastInstanceID
+    local newest, lastIsCurrent
+    if EJ_GetNumTiers and EJ_SelectTier and EJ_GetInstanceByIndex then
         EJ_SelectTier(EJ_GetNumTiers())
         local i = 1
         while true do
             local id = EJ_GetInstanceByIndex(i, true)
             if not id then break end
-            inst = id
+            newest = id
+            if last and id == last then lastIsCurrent = true end
             i = i + 1
         end
     end
-    return inst
+    if lastIsCurrent then
+        if db then db.currentRaidInst = last end
+        return last
+    end
+    -- remember the season's raid whenever the walk is warm: the passive
+    -- journal recorder gates its raid writes on this (browsing an OLD
+    -- raid must never pollute the season pools)
+    if newest and db then db.currentRaidInst = newest end
+    -- cold data engine: fall back to last so the kick+retry cycle can
+    -- heal us into the newest raid on a later pass
+    return newest or last
 end
 
 local function OpenJournalToCurrentRaid()
@@ -2258,128 +2841,416 @@ local function OpenJournalToCurrentRaid()
 end
 
 -- ── Background pool primer ──────────────────────────────────────────────────
--- Confirm every boss's coin pool WITHOUT the player ever opening the
--- guide: drive the journal's data engine directly (tier, instance, the
--- player's own class+spec loot filter, each raid difficulty in turn),
--- wait for the async loot data, and harvest it into poolCache. Runs only
--- while the journal window is closed so it never fights the real UI.
-local primerActive = false
-local primerRetryQueued = false
-local PrimePoolCache   -- forward: the retry closure below re-enters it
-local PRIME_DIFFS = { 15, 16, 14, 17 }   -- 17 = Raid Finder rolls too
+-- The journal data engine IS the sources database - the same Journal
+-- tables Raidbots' scripts extract from the client, live in-game. The
+-- primer walks ALL of it headlessly at load: every newest-tier raid at
+-- the four raid difficulties, every season dungeon at Mythic Keystone,
+-- for EVERY spec of the player's class - so both overviews and the
+-- journal overlays always have a confirmed pool without anyone opening
+-- the guide. Runs only while the journal window is closed so it never
+-- fights the real UI.
+local PrimePoolCache   -- forward: refreshes, login timers and retries call it
+do
+    local primerActive = false
+    local primerRetryQueued = false
+    local primerScrubbed = false
+    local primeFailed = {}      -- per-session: pages that served nothing; retried next login
+    local primeLinkTried = {}   -- per-session: one link-upgrade visit per stamped page
+    local PRIME_DIFFS = { 15, 16, 14, 17 }   -- 17 = Raid Finder rolls too
+    -- bump to force one global re-prime after a harvest fix (":l3" = the
+    -- stability-rule rework: a stamp only lands when a pass stops growing)
+    local PRIME_EPOCH = ":l3"
+    -- dungeon pages are asked at Keystone first, but some old-expansion
+    -- season dungeons only serve loot at Mythic or Heroic headlessly
+    -- (TokenLab-proven: Kings' Rest returns nothing at 8, everything at
+    -- 23) - the item SET is identical across dungeon difficulties
+    local DUNGEON_DIFFS = { 8, 23, 2 }
 
-local function HarvestJournalLoot(diff)
-    local n = (EJ_GetNumLoot and EJ_GetNumLoot()) or 0
-    local fresh, got = {}, 0
-    for i = 1, n do
-        local info = C_EncounterJournal.GetLootInfoByIndex(i)
-        if info and info.name and info.encounterID and info.itemID
-            and not info.displayAsPerPlayerLoot
-            and info.slot and info.slot ~= "" then
-            fresh[info.encounterID] = fresh[info.encounterID] or {}
-            -- store the LINK (not just true): it carries the difficulty's
-            -- real item level for tooltips and powers the gear scan
-            fresh[info.encounterID][info.itemID] = info.link or true
-            got = got + 1
-        end
+    -- the primer must not steer the journal's data engine while the real
+    -- UI is using it - but "come back later" instead of giving up, so a
+    -- first-install session still ends fully confirmed
+    local function QueuePrimerRetry()
+        if primerRetryQueued then return end
+        primerRetryQueued = true
+        C_Timer.After(15, function()
+            primerRetryQueued = false
+            PrimePoolCache()
+        end)
     end
-    if got > 0 then
-        poolStore[diff] = poolStore[diff] or {}
-        for enc, set in pairs(fresh) do
-            poolStore[diff][enc] = set
-        end
-    end
-    return got
-end
 
--- Complete = a full headless pass ran, OR every boss of the raid already has
--- a cached pool. A pool recorded from real journal views covers only the
--- bosses the player clicked, so "poolCache non-empty" is NOT completeness -
--- that early-out left every unvisited boss unconfirmed forever.
-local function PoolNeedsPrime(d, inst)
-    if poolPrimed[d] == inst then return false end
-    if not EJ_GetEncounterInfoByIndex then return false end
-    local i = 1
-    while true do
-        local name, _, bossID = EJ_GetEncounterInfoByIndex(i, inst)
-        if not name or not bossID then break end
-        if not (poolStore[d] and poolStore[d][bossID]) then return true end
-        i = i + 1
+    local function EnsureSpecStore(specID)
+        db.poolBySpec = db.poolBySpec or {}
+        local s = db.poolBySpec[specID] or {}
+        db.poolBySpec[specID] = s
+        s.cache = s.cache or {}
+        s.primedAt = s.primedAt or {}
+        return s
     end
-    return i == 1   -- no boss list yet either: the primer's select loads it
-end
 
--- the primer must not steer the journal's data engine while the real UI is
--- using it - but "come back later" instead of giving up, so a first-install
--- session still ends fully confirmed
-local function QueuePrimerRetry()
-    if primerRetryQueued then return end
-    primerRetryQueued = true
-    C_Timer.After(15, function()
-        primerRetryQueued = false
-        PrimePoolCache()
-    end)
-end
-
-PrimePoolCache = function()
-    if primerActive or not char then return end
-    if not storesLinked then RelinkSpecStores() end
-    if EncounterJournal and EncounterJournal:IsShown() then QueuePrimerRetry() return end
-    local inst = GetCurrentRaidInstanceID()
-    if not inst then return end
-    local missing = {}
-    for _, d in ipairs(PRIME_DIFFS) do
-        if PoolNeedsPrime(d, inst) then
-            missing[#missing + 1] = d
-        end
-    end
-    if #missing == 0 then return end
-    primerActive = true
-    if EJ_SetLootFilter then
+    -- every spec of the player's class, the current one first (the pages
+    -- being looked at fill before the offspec stores do)
+    local function ClassSpecList()
         local classID = select(3, UnitClass("player"))
-        local specIndex = C_SpecializationInfo and C_SpecializationInfo.GetSpecialization
-            and C_SpecializationInfo.GetSpecialization() or nil
-        local specID = specIndex and C_SpecializationInfo.GetSpecializationInfo(specIndex) or 0
-        EJ_SetLootFilter(classID or 0, specID or 0)
+        local cur = CurrentSpecID()
+        local list = {}
+        if cur then list[#list + 1] = cur end
+        local getNum = C_SpecializationInfo and C_SpecializationInfo.GetNumSpecializationsForClassID
+            or GetNumSpecializationsForClassID
+        local getInfo = GetSpecializationInfoForClassID
+            or (C_SpecializationInfo and C_SpecializationInfo.GetSpecializationInfoForClassID)
+        local n = (classID and getNum) and getNum(classID) or 0
+        for i = 1, n do
+            local id = getInfo and getInfo(classID, i)
+            if id and id ~= cur then list[#list + 1] = id end
+        end
+        return classID, list
     end
-    if EJ_SelectTier and EJ_GetNumTiers then EJ_SelectTier(EJ_GetNumTiers()) end
-    if EJ_SelectInstance then EJ_SelectInstance(inst) end
-    local idx, tries = 0, 0
-    local function step()
-        if EncounterJournal and EncounterJournal:IsShown() then
-            primerActive = false   -- the real UI took over; back off
-            QueuePrimerRetry()     -- and finish once it is closed again
+
+    local function SetJournalLootFilter(classID, specID)
+        if EJ_SetLootFilter then EJ_SetLootFilter(classID or 0, specID or 0) end
+    end
+
+    -- a pool entry is `true` until a harvest attaches its LINK (the real
+    -- per-difficulty item: tooltips, quality, the gear scan). Seeded and
+    -- old entries start linkless - a STAMPED page that still holds any is
+    -- re-visited once per session so links land on it too.
+    local function HasLinkless(bucket, encsFilter)
+        if not bucket then return false end
+        if encsFilter then
+            for enc in pairs(encsFilter) do
+                local set = bucket[enc]
+                if set then
+                    for _, v in pairs(set) do
+                        if v == true then return true end
+                    end
+                end
+            end
+            return false
+        end
+        for _, v in pairs(bucket) do
+            if v == true then return true end
+        end
+        return false
+    end
+
+    -- one harvest PASS: read what the engine has streamed so far and merge
+    -- it into the destination store (links preferred, never downgraded to
+    -- true). Returns accepted gear rows, rows whose item data has not
+    -- streamed yet (name still nil), and the set of what THIS pass saw -
+    -- the stability rule and the reconcile both need them.
+    local function PrimerHarvest(job)
+        local n = (EJ_GetNumLoot and EJ_GetNumLoot()) or 0
+        local accepted, coldRows = 0, 0
+        local seen = {}
+        local dest
+        for i = 1, n do
+            local info = C_EncounterJournal.GetLootInfoByIndex(i)
+            if info and info.itemID then
+                if not info.name then
+                    coldRows = coldRows + 1
+                elseif info.encounterID and not info.displayAsPerPlayerLoot
+                    and info.slot and info.slot ~= "" then
+                    accepted = accepted + 1
+                    local cache = job.store.cache
+                    if not dest then
+                        if job.dungeon then
+                            -- one flat pool per dungeon: every boss together
+                            cache.mplusBonus = cache.mplusBonus or {}
+                            dest = cache.mplusBonus[job.inst] or {}
+                            cache.mplusBonus[job.inst] = dest
+                        else
+                            cache[job.diff] = cache[job.diff] or {}
+                            dest = cache[job.diff]
+                        end
+                    end
+                    -- MERGE, never wholesale-replace: the journal streams
+                    -- loot in and a pass can catch a boss half-loaded -
+                    -- replacing froze 3-of-4 pools forever
+                    local slot = dest
+                    if job.dungeon then
+                        seen[info.itemID] = true
+                    else
+                        slot = dest[info.encounterID]
+                        if not slot then
+                            slot = {}
+                            dest[info.encounterID] = slot
+                        end
+                        local se = seen[info.encounterID]
+                        if not se then
+                            se = {}
+                            seen[info.encounterID] = se
+                        end
+                        se[info.itemID] = true
+                    end
+                    local v = info.link or true
+                    if type(v) == "string" or slot[info.itemID] == nil then
+                        slot[info.itemID] = v
+                    end
+                end
+            end
+        end
+        return accepted, coldRows, seen
+    end
+
+    -- once a page proves FULLY streamed (stable pass, nothing cold), the
+    -- pool is reconciled to exactly what the journal lists: stale items
+    -- (removed by Blizzard, or junk merged in long ago) cannot linger.
+    -- Raid reconciles only THIS instance's bosses - the difficulty bucket
+    -- is shared by every raid of the tier.
+    local function ReconcileJob(job, seen)
+        local cache = job.store.cache
+        if job.dungeon then
+            local dest = cache.mplusBonus and cache.mplusBonus[job.inst]
+            if dest then
+                for itemID in pairs(dest) do
+                    if not seen[itemID] then dest[itemID] = nil end
+                end
+            end
             return
         end
-        if tries > 0 then
-            local got = HarvestJournalLoot(missing[idx])
-            if got == 0 and tries < 5 then
-                tries = tries + 1
-                C_Timer.After(0.7, step)   -- loot data is async; wait more
+        local dest = cache[job.diff]
+        if not (dest and job.encs) then return end
+        for enc in pairs(job.encs) do
+            local set = dest[enc]
+            if set then
+                local seenSet = seen[enc]
+                if not seenSet then
+                    dest[enc] = nil
+                else
+                    for itemID in pairs(set) do
+                        if not seenSet[itemID] then set[itemID] = nil end
+                    end
+                end
+            end
+        end
+    end
+
+    -- one-time login scrub: the instance-hijack era and old recorder gaps
+    -- left junk behind (Kings' Rest bosses inside the raid pools, stray
+    -- difficulty buckets, stale stamps). Only runs against a WARM walk.
+    local function ScrubStores(raidEncSet, raidSet, dungeonSet)
+        for _, store in pairs(db.poolBySpec or {}) do
+            local cache = type(store) == "table" and store.cache or nil
+            if type(cache) == "table" then
+                for k in pairs(cache) do
+                    if not (k == "mplusBonus" or k == 14 or k == 15 or k == 16 or k == 17) then
+                        cache[k] = nil
+                    end
+                end
+                for _, d in ipairs(PRIME_DIFFS) do
+                    local encs = cache[d]
+                    if encs then
+                        for enc in pairs(encs) do
+                            if not raidEncSet[enc] then encs[enc] = nil end
+                        end
+                    end
+                end
+                if cache.mplusBonus then
+                    for instID in pairs(cache.mplusBonus) do
+                        if not dungeonSet[instID] then cache.mplusBonus[instID] = nil end
+                    end
+                end
+            end
+            if type(store) == "table" and type(store.primedAt) == "table" then
+                for k, v in pairs(store.primedAt) do
+                    if type(v) ~= "string" or not v:find(PRIME_EPOCH, 1, true) then
+                        store.primedAt[k] = nil
+                    end
+                end
+            end
+        end
+        if type(db.bossList) == "table" then
+            for inst in pairs(db.bossList) do
+                if not raidSet[inst] then db.bossList[inst] = nil end
+            end
+        end
+    end
+
+    PrimePoolCache = function()
+        if primerActive or not char then return end
+        if not storesLinked then RelinkSpecStores() end
+        if EncounterJournal and EncounterJournal:IsShown() then QueuePrimerRetry() return end
+        if not (EJ_SelectTier and EJ_GetNumTiers and EJ_GetInstanceByIndex
+            and EJ_SelectInstance and EJ_SetDifficulty and C_EncounterJournal) then return end
+        -- the newest tier IS the season: its raids plus its dungeon rotation
+        EJ_SelectTier(EJ_GetNumTiers())
+        local raids, dungeons, dungeonSet = {}, {}, {}
+        local i = 1
+        while true do
+            local id = EJ_GetInstanceByIndex(i, true)
+            if not id then break end
+            raids[#raids + 1] = id
+            i = i + 1
+        end
+        i = 1
+        while true do
+            local id = EJ_GetInstanceByIndex(i, false)
+            if not id then break end
+            if id ~= MPLUS_AGGREGATE_INSTANCE then
+                dungeons[#dungeons + 1] = id
+                dungeonSet[id] = true
+            end
+            i = i + 1
+        end
+        if #raids == 0 and #dungeons == 0 then QueuePrimerRetry() return end
+        table.sort(dungeons)
+        -- the dungeon stamps carry the season's rotation: a rotation change
+        -- automatically invalidates every dungeon pool
+        local seasonKey = table.concat(dungeons, "-") .. PRIME_EPOCH
+        -- per-raid encounter walks: job building and the scrub both need
+        -- them; a raid the engine has not streamed yet (0 bosses) is
+        -- skipped this pass and picked up by a later primer call
+        local raidSet, raidEncSet, raidEncCount, raidEncsByInst = {}, {}, {}, {}
+        for _, inst in ipairs(raids) do
+            raidSet[inst] = true
+            local mine = {}
+            raidEncsByInst[inst] = mine
+            local c, bi = 0, 1
+            while true do
+                local nm, _, bid = EJ_GetEncounterInfoByIndex(bi, inst)
+                if not nm or not bid then break end
+                raidEncSet[bid] = true
+                mine[bid] = true
+                c = c + 1
+                bi = bi + 1
+            end
+            raidEncCount[inst] = c
+        end
+        local currentRaid = GetCurrentRaidInstanceID()
+        if not primerScrubbed and currentRaid and (raidEncCount[currentRaid] or 0) > 0 then
+            primerScrubbed = true
+            ScrubStores(raidEncSet, raidSet, dungeonSet)
+        end
+        local classID, specs = ClassSpecList()
+        if #specs == 0 then return end
+        local jobs = {}
+        for _, specID in ipairs(specs) do
+            local store = EnsureSpecStore(specID)
+            for _, inst in ipairs(raids) do
+                if (raidEncCount[inst] or 0) > 0 then
+                    for _, d in ipairs(PRIME_DIFFS) do
+                        local key = inst .. ":" .. d
+                        local sk = specID .. ":" .. key
+                        local fresh = store.primedAt[key] ~= PRIME_EPOCH
+                        local relink = not fresh and not primeLinkTried[sk]
+                            and HasLinkless(store.cache[d], raidEncsByInst[inst])
+                        if (fresh or relink) and not primeFailed[sk] then
+                            if relink then primeLinkTried[sk] = true end
+                            jobs[#jobs + 1] = { spec = specID, store = store,
+                                                inst = inst, diff = d, stamp = key,
+                                                encs = raidEncsByInst[inst] }
+                        end
+                    end
+                end
+            end
+            for _, instID in ipairs(dungeons) do
+                local key = "m" .. instID
+                local sk = specID .. ":" .. key
+                local fresh = store.primedAt[key] ~= seasonKey
+                local relink = not fresh and not primeLinkTried[sk]
+                    and HasLinkless(store.cache.mplusBonus and store.cache.mplusBonus[instID])
+                if (fresh or relink) and not primeFailed[sk] then
+                    if relink then primeLinkTried[sk] = true end
+                    jobs[#jobs + 1] = { spec = specID, store = store,
+                                        inst = instID, diff = MPLUS_DIFF, dungeon = true,
+                                        stamp = key, stampVal = seasonKey }
+                end
+            end
+        end
+        if #jobs == 0 then return end
+        primerActive = true
+        -- announce a real fill ONLY when the shipped seed does not cover
+        -- this season (fresh season before the addon update lands): with a
+        -- current seed the pages are already full and the fill is just
+        -- silent link/verify housekeeping
+        local seedCurrent = NS.PoolSeed and NS.PoolSeed.dungeons == table.concat(dungeons, "-")
+        if #jobs >= 10 and not seedCurrent then
+            print(("|cff3fc9f2Arc Loot Planner|r building the loot database in the background (%d journal pages) - it will report when done."):format(#jobs))
+        end
+        local idx = 0
+        local stamped = 0
+        local passes, lastAccepted = 0, -1
+        local curFilterSpec
+        local job
+        local nextJob, passStep
+        nextJob = function()
+            idx = idx + 1
+            job = jobs[idx]
+            if not job then
+                primerActive = false
+                -- leave the journal's loot filter on the player's own spec
+                SetJournalLootFilter(classID, CurrentSpecID())
+                WipeLootPool()
+                RefreshEJ()
+                if RefreshWindow then RefreshWindow() end
+                if stamped > 0 and not seedCurrent then
+                    print(("|cff3fc9f2Arc Loot Planner|r loot database confirmed - %d journal pages across your specs."):format(stamped))
+                end
                 return
             end
-            if got > 0 then
-                -- a headless pass lists the WHOLE instance at once: this
-                -- difficulty is complete for THIS raid, not just the bosses
-                -- someone happened to click in the journal
-                poolPrimed[missing[idx]] = inst
+            if curFilterSpec ~= job.spec then
+                SetJournalLootFilter(classID, job.spec)
+                curFilterSpec = job.spec
             end
-            tries = 0
+            EJ_SelectInstance(job.inst)
+            EJ_SetDifficulty(job.diff)
+            passes, lastAccepted = 0, -1
+            C_Timer.After(0.7, passStep)
         end
-        idx = idx + 1
-        local d = missing[idx]
-        if not d then
-            primerActive = false
-            WipeLootPool()
-            RefreshEJ()
-            if RefreshWindow then RefreshWindow() end
-            return
+        passStep = function()
+            if EncounterJournal and EncounterJournal:IsShown() then
+                primerActive = false   -- the real UI took over; back off
+                QueuePrimerRetry()     -- and finish once it is closed again
+                return
+            end
+            passes = passes + 1
+            local accepted, coldRows, seen = PrimerHarvest(job)
+            -- STABILITY RULE (TokenLab-proven): loot streams in over
+            -- several passes - names, slots, whole rows arrive late
+            -- (Kings' Rest served ONE row on its first probe pass). A page
+            -- is only stamped confirmed when a pass stops growing and
+            -- nothing is left unstreamed; stamping on first contact is how
+            -- pools froze half-full before.
+            local stable = accepted > 0 and accepted == lastAccepted and coldRows == 0
+            -- a page that is confidently EMPTY (no gear rows, nothing still
+            -- streaming, three passes running) needs no full cap - move on
+            -- to the difficulty fallback / next job early
+            local emptyDone = accepted == 0 and coldRows == 0 and passes >= 3
+            if not stable and not emptyDone and passes < 8 then
+                lastAccepted = accepted
+                C_Timer.After(0.7, passStep)
+                return
+            end
+            if accepted > 0 then
+                -- a cap-stamp (page never went stable) skips the reconcile:
+                -- deleting against a half-streamed list would eat real loot
+                if stable then ReconcileJob(job, seen) end
+                job.store.primedAt[job.stamp] = job.stampVal or PRIME_EPOCH
+                stamped = stamped + 1
+                -- the open page fills in progressively as its spec's
+                -- pools land
+                if job.spec == CurrentSpecID() and RefreshWindow then RefreshWindow() end
+            else
+                -- dungeon page served nothing: walk the difficulty
+                -- fallback chain before giving up on it
+                if job.dungeon then
+                    job.dt = (job.dt or 1) + 1
+                    local fb = DUNGEON_DIFFS[job.dt]
+                    if fb then
+                        EJ_SetDifficulty(fb)
+                        passes, lastAccepted = 0, -1
+                        C_Timer.After(0.7, passStep)
+                        return
+                    end
+                end
+                -- nothing on any difficulty: leave unstamped, do not
+                -- hammer it again this session
+                primeFailed[job.spec .. ":" .. job.stamp] = true
+            end
+            C_Timer.After(0.2, nextJob)
         end
-        EJ_SetDifficulty(d)
-        tries = 1
-        C_Timer.After(0.7, step)
+        nextJob()
     end
-    step()
 end
 
 -- ── Options window (Arc theme, tabbed) ──────────────────────────────────────
@@ -2607,16 +3478,102 @@ local function OverviewItemClick(self)
     if RefreshWindow then RefreshWindow() end
 end
 
+-- ── Sim-ilvl tooltip links ──────────────────────────────────────────────────
+-- TokenLab-proven: a SINGLE bonus id from the season's level-set family
+-- makes any item link render at that exact level (12846 -> 321 on a
+-- base-19 probe item), and GetDetailedItemLevelInfo computes synthetic
+-- links client-side. The right id per level is DISCOVERED at runtime by
+-- asking the client to render candidates - nothing is shipped, nothing
+-- can rot; a failed scan just falls back to the base preview.
+local ResolveIlvlBonus
+do
+    local PROBE_ITEM = 159288   -- base ilvl 19: any season-level hit is unambiguous
+    local SCAN_RANGES = { { 12700, 13000 }, { 13300, 13950 }, { 12000, 12700 } }
+    local cache = {}            -- [lv] = bonusID, or false = scanned, none found
+    local probeReady
+    ResolveIlvlBonus = function(lv)
+        if type(lv) ~= "number" then return nil end
+        local hit = cache[lv]
+        if hit ~= nil then return hit or nil end
+        local getIlvl = C_Item and C_Item.GetDetailedItemLevelInfo or GetDetailedItemLevelInfo
+        if not getIlvl then return nil end
+        if not probeReady then
+            -- the probe item must be item-cached or every render reads nil
+            if not getIlvl("item:" .. PROBE_ITEM) then
+                local obj = Item:CreateFromItemID(PROBE_ITEM)
+                obj:ContinueOnItemLoad(function() probeReady = true end)
+                return nil   -- warms in a moment; the next hover resolves
+            end
+            probeReady = true
+        end
+        local me = UnitLevel("player") or 80
+        for _, range in ipairs(SCAN_RANGES) do
+            for b = range[1], range[2] do
+                local il = getIlvl(("item:%d::::::::%d::::1:%d"):format(PROBE_ITEM, me, b))
+                if il == lv then
+                    cache[lv] = b
+                    return b
+                end
+            end
+        end
+        cache[lv] = false
+        return nil
+    end
+end
+
 local function OverviewItemTooltip(self)
     local s = self.state
     if not s then return end
-    GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-    -- the stored journal link carries THIS difficulty's real item level;
-    -- a bare itemID would show the base (wrong-track) version
-    if s.link then
-        GameTooltip:SetHyperlink(s.link)
-    else
-        GameTooltip:SetItemByID(s.itemID)
+    -- cursor-anchored: the rows span the whole list, so ANCHOR_RIGHT put
+    -- the tooltip a full row-width away from the pointer
+    GameTooltip:SetOwner(self, "ANCHOR_CURSOR_RIGHT", 12, -6)
+    -- any row with a known sim level gets the REAL tooltip at that level
+    -- via a client-verified synthetic link - UNLESS the stored journal
+    -- link already renders it (raid drops pages: the link IS the right
+    -- version, and its native bonus set beats a synthetic one). Covers
+    -- M+ (journal only serves base-Mythic) AND vault-priced raid rows
+    -- (the coin grants the vault track, not the page's difficulty).
+    local synthetic
+    if s.simLv then
+        local getIlvl = C_Item and C_Item.GetDetailedItemLevelInfo or GetDetailedItemLevelInfo
+        local linkLv = (s.link and getIlvl) and getIlvl(s.link) or nil
+        if linkLv ~= s.simLv then
+            local b = ResolveIlvlBonus(s.simLv)
+            if b then
+                GameTooltip:SetHyperlink(("item:%d::::::::%d::::1:%d"):format(
+                    s.itemID, UnitLevel("player") or 80, b))
+                GameTooltip:AddLine(("Shown at your sim's item level (%d)."):format(s.simLv), 0.25, 0.79, 0.95, true)
+                synthetic = true
+            end
+        end
+    end
+    if not synthetic then
+        -- the stored journal link carries THIS difficulty's real item
+        -- level; a bare itemID would show the base (wrong-track) version
+        if s.link then
+            GameTooltip:SetHyperlink(s.link)
+        else
+            GameTooltip:SetItemByID(s.itemID)
+            -- a bare itemID previews the BASE version only (an
+            -- old-expansion dungeon item renders as low-level trash)
+            if s.diff == MPLUS_DIFF then
+                GameTooltip:AddLine("Base preview - the actual Mythic+ drop is a higher item level.", 0.55, 0.63, 0.76, true)
+            end
+        end
+        if s.simLv then
+            GameTooltip:AddLine(("Your sim priced this at item level %d."):format(s.simLv), 0.25, 0.79, 0.95, true)
+        end
+    end
+    if s.simConv then
+        -- the shown value comes from CONVERTING this drop (catalyst /
+        -- token): say what it becomes, and what it sims uncatalyzed
+        local convName = C_Item.GetItemInfo(s.simConv)
+        GameTooltip:AddLine(("Best used through the Catalyst - becomes %s."):format(
+            convName or "your set piece"), 0.25, 0.79, 0.95, true)
+        if s.simAsTxt then
+            GameTooltip:AddLine(("As dropped it sims %s - the shown value is the catalyzed use."):format(
+                s.simAsTxt), 0.55, 0.63, 0.76, true)
+        end
     end
     if s.owned then
         GameTooltip:AddLine(s.source == "manual"
@@ -2982,12 +3939,26 @@ local function OverviewRefresh(pg)
                                             link = (type(v) == "string") and v or nil }
                         if not IsOwnedItem(itemID, ownDiff) then remaining = remaining + 1 end
                     end
-                    -- NOTE: no token union here (Arc's ruling) - tier
-                    -- conversion pieces belong to the DROPS tab only
                 elseif gains and next(gains) then
                     for itemID, g in pairs(gains) do
-                        list[#list + 1] = { itemID = itemID, gain = g }
-                        if not IsOwnedItem(itemID, ownDiff) then remaining = remaining + 1 end
+                        if not IsTokenItem(itemID) then
+                            list[#list + 1] = { itemID = itemID, gain = g }
+                            if not IsOwnedItem(itemID, ownDiff) then remaining = remaining + 1 end
+                        end
+                    end
+                end
+                -- the boss's set token rolls too (Arc's correction): shown
+                -- as the PIECE it becomes for this spec, never the token
+                -- (in the no-cache branch a piece-keyed sim entry already
+                -- listed itself as a plain row)
+                if not mplusMode then
+                    local hadCache = cache and next(cache) ~= nil
+                    local piece, tGain, tOwned, _src, inGains = GetBossTokenOutcome(bossID, simKey, ownDiff)
+                    -- never duplicate: skip when the piece is already a pool
+                    -- row (or a plain gains row in the no-cache branch)
+                    if piece and ((hadCache and not cache[piece]) or (not hadCache and not inGains)) then
+                        list[#list + 1] = { itemID = piece, tokenOutcome = true, gain = tGain }
+                        if not tOwned then remaining = remaining + 1 end
                     end
                 end
                 if #list > 0 then
@@ -3002,13 +3973,19 @@ local function OverviewRefresh(pg)
                         it:SetPoint("TOPRIGHT", 0, y)
                         y = y - 26
                         local owned, source = IsOwnedItem(entry.itemID, ownDiff)
+                        local cvPiece = ev and ev.cv and ev.cv[entry.itemID]
+                        local caGain = cvPiece and ev.ca and ev.ca[entry.itemID] or nil
                         it.state = { itemID = entry.itemID, diff = ownDiff, owned = owned,
-                                     source = source, link = entry.link }
+                                     source = source, link = entry.link,
+                                     simLv = ev and ev.lv and ev.lv[entry.itemID],
+                                     simConv = cvPiece,
+                                     simAsTxt = caGain and FormatGainNumber(caGain, simKey) or nil }
                         it.icon:SetTexture(C_Item.GetItemIconByID(entry.itemID) or 134400)
                         it.check:SetShown(owned)
                         it.ghost:Hide()
                         it.rank:Hide()
-                        it.name:SetText(OverviewItemName(pg, entry.itemID))
+                        it.name:SetText(OverviewItemName(pg, entry.itemID)
+                            .. (cvPiece and "  |cff8ca0b8(Catalyst)|r" or ""))
                         if owned then
                             it.share:SetText("")
                             it.gain:SetText("")
@@ -3040,8 +4017,8 @@ local function OverviewRefresh(pg)
                     it.check:Hide()
                     it.rank:Hide()
                     it.name:SetText(mplusMode
-                        and "|cff8ca0b8No data for this dungeon yet - import a Mythic+ bonus roll sim, or open its Adventure Guide page once.|r"
-                        or "|cff8ca0b8No data for this boss yet - import a sim, or open the Adventure Guide once.|r")
+                        and "|cff8ca0b8Confirming this dungeon's pool from the game's journal data - a few seconds...|r"
+                        or "|cff8ca0b8Confirming this boss's pool from the game's journal data - a few seconds...|r")
                     it.share:SetText("")
                     it.gain:SetText("")
                     it:Show()
@@ -3060,9 +4037,7 @@ local function OverviewRefresh(pg)
                     it.icon:SetTexture(CoinIconTexture())
                     it.check:Hide()
                     it.rank:Hide()
-                    it.name:SetText(mplusMode
-                        and "|cff8ca0b8Sim-priced list - open this dungeon's Adventure Guide page once to confirm its full pool.|r"
-                        or "|cff8ca0b8Confirming this pool from the game's journal data - a few seconds...|r")
+                    it.name:SetText("|cff8ca0b8Sim-priced list - confirming the full pool from the game's journal data...|r")
                     it.share:SetText("")
                     it.gain:SetText("")
                     it:Show()
@@ -3075,19 +4050,19 @@ local function OverviewRefresh(pg)
     for k = itemsShown + 1, #pg.itemRows do pg.itemRows[k]:Hide() end
     pg.listContent:SetHeight(math.max(1, -y + 4))
     pg.listScroll:UpdateScroll()
-    if shown == 0 and (inst or mplusMode) then
+    if shown == 0 then
         -- the journal's data engine has not streamed this list yet (right
         -- after login, or the Adventure Guide is parked elsewhere). Kick it
         -- awake when the real journal is closed, and KEEP retrying while
-        -- the page is up - a retry cap left the page stuck on "Loading..."
-        -- forever when the guide sat open. Once a list loads it is saved
-        -- statically (db.bossList / db.dungeonList above), so this path
-        -- only ever runs before the FIRST successful load on this account.
+        -- the page is up. Kick EVEN when inst is unknown: discovering the
+        -- instance NEEDS the tier data awake, so gating the kick (or the
+        -- retry) on inst was a circular dead-end - the page sat on
+        -- "Loading the raid list..." forever on a cold character.
         local ejBusy = EncounterJournal and EncounterJournal:IsShown()
         if not ejBusy and not mplusMode
-            and EJ_SelectTier and EJ_GetNumTiers and EJ_SelectInstance then
+            and EJ_SelectTier and EJ_GetNumTiers then
             EJ_SelectTier(EJ_GetNumTiers())
-            EJ_SelectInstance(inst)
+            if inst and EJ_SelectInstance then EJ_SelectInstance(inst) end
         end
         pg._loadRetries = (pg._loadRetries or 0) + 1
         local delay = ejBusy and 2 or (pg._loadRetries > 6 and 3 or 0.8)
@@ -3257,7 +4232,13 @@ local function DropsRefresh(pg)
                     local v = poolStore[diff] and poolStore[diff][e.enc] and poolStore[diff][e.enc][e.itemID]
                     if type(v) == "string" then link = v end
                 end
-                it.state = { itemID = e.itemID, diff = ownDiff, owned = false, link = link }
+                local tev = simStore[diff]
+                local tCv = tev and tev.cv and tev.cv[e.itemID]
+                local tCa = tCv and tev.ca and tev.ca[e.itemID] or nil
+                it.state = { itemID = e.itemID, diff = ownDiff, owned = false, link = link,
+                             simLv = tev and tev.lv and tev.lv[e.itemID],
+                             simConv = tCv,
+                             simAsTxt = tCa and FormatGainNumber(tCa, diff) or nil }
                 it.icon:SetTexture(C_Item.GetItemIconByID(e.itemID) or 134400)
                 it.check:Hide()
                 it.ghost:Hide()
@@ -3351,7 +4332,14 @@ local function DropsRefresh(pg)
                     if gains and not mplusMode then
                         for itemID, g in pairs(gains) do
                             if cache[itemID] == nil then
-                                list[#list + 1] = { itemID = itemID, gain = g, fromToken = true }
+                                -- old imports credited conversions to the
+                                -- sim's TOKEN id: show those as the piece
+                                -- they become (Arc's model)
+                                local show = itemID
+                                if IsTokenItem(itemID) and not OMNI_TOKENS[itemID] then
+                                    show = TokenPieceFor(itemID) or itemID
+                                end
+                                list[#list + 1] = { itemID = show, gain = g, fromToken = true }
                             end
                         end
                     end
@@ -3372,12 +4360,18 @@ local function DropsRefresh(pg)
                         it:SetPoint("TOPRIGHT", 0, y)
                         y = y - 26
                         local owned, source = IsOwnedItem(entry.itemID, ownDiff)
+                        local cvPiece = ev and ev.cv and ev.cv[entry.itemID]
+                        local caGain = cvPiece and ev.ca and ev.ca[entry.itemID] or nil
                         it.state = { itemID = entry.itemID, diff = ownDiff, owned = owned,
-                                     source = source, link = entry.link }
+                                     source = source, link = entry.link,
+                                     simLv = ev and ev.lv and ev.lv[entry.itemID],
+                                     simConv = cvPiece,
+                                     simAsTxt = caGain and FormatGainNumber(caGain, diff) or nil }
                         it.icon:SetTexture(C_Item.GetItemIconByID(entry.itemID) or 134400)
                         it.check:SetShown(owned)
                         it.ghost:Hide()
-                        it.name:SetText(OverviewItemName(pg, entry.itemID))
+                        it.name:SetText(OverviewItemName(pg, entry.itemID)
+                            .. (cvPiece and "  |cff8ca0b8(Catalyst)|r" or ""))
                         it.share:SetText("")
                         -- a Top 5 item wears its gold rank here too
                         local r = (not owned) and rankOf[entry.itemID] or nil
@@ -3414,8 +4408,8 @@ local function DropsRefresh(pg)
                     it.check:Hide()
                     it.rank:Hide()
                     it.name:SetText(mplusMode
-                        and "|cff8ca0b8No data yet - import a Mythic+ runs sim, and open this dungeon's guide page once.|r"
-                        or "|cff8ca0b8No data for this boss yet - import a sim, or open the Adventure Guide once.|r")
+                        and "|cff8ca0b8Confirming this dungeon's pool from the game's journal data - a few seconds...|r"
+                        or "|cff8ca0b8Confirming this boss's pool from the game's journal data - a few seconds...|r")
                     it.share:SetText("")
                     it.gain:SetText("")
                     it:Show()
@@ -3428,12 +4422,13 @@ local function DropsRefresh(pg)
     for k = itemsShown + 1, #pg.itemRows do pg.itemRows[k]:Hide() end
     pg.listContent:SetHeight(math.max(1, -y + 4))
     pg.listScroll:UpdateScroll()
-    if shown == 0 and (inst or mplusMode) then
+    if shown == 0 then
+        -- kick even when inst is unknown - see the note in OverviewRefresh
         local ejBusy = EncounterJournal and EncounterJournal:IsShown()
         if not ejBusy and not mplusMode
-            and EJ_SelectTier and EJ_GetNumTiers and EJ_SelectInstance then
+            and EJ_SelectTier and EJ_GetNumTiers then
             EJ_SelectTier(EJ_GetNumTiers())
-            EJ_SelectInstance(inst)
+            if inst and EJ_SelectInstance then EJ_SelectInstance(inst) end
         end
         pg._loadRetries = (pg._loadRetries or 0) + 1
         local delay = ejBusy and 2 or (pg._loadRetries > 6 and 3 or 0.8)
@@ -3869,11 +4864,16 @@ local function EnsureWindow()
             if sims.Refresh then sims:Refresh() end   -- re-derive step 2 now
         end,
         nil,
-        "Run a Raidbots Droptimizer for the spec you are on, then paste the report link here.",
+        "Run a Raidbots Droptimizer for the spec you are on, then paste the report link here. Healers: a QE Live Upgrade Finder report link works too.",
         nil,
         true)   -- live: step 2 must populate the moment the link is pasted
     AT.RowInput(sims, "2. Open THIS address",
         function()
+            -- healers: a QE Live Upgrade Finder report converts too
+            local qe = linkInput:match("upgradereport/(%w+)")
+            if qe then
+                return "https://questionablyepic.com/api/getUpgradeReport.php?reportID=" .. qe
+            end
             local id = linkInput:match("simbot/report/(%w+)") or linkInput:match("/reports/(%w+)")
             return id and ("https://www.raidbots.com/reports/" .. id .. "/data.csv") or ""
         end,
@@ -3912,18 +4912,27 @@ local function EnsureWindow()
                 return
             end
             local bucket = SimBucketFor(targetKey, targetSpec)
-            local diffs, items = ApplySimImport(pasteEB and pasteEB:GetText() or "", bucket)
+            local tName = targetKey:match("^(.-)%s*%-") or targetKey
+            local tClass = (targetKey == CharKey()) and select(3, UnitClass("player"))
+                or (db.chars[targetKey] and db.chars[targetKey].classID) or nil
+            local diffs, items, impErr, usedSpec = ApplySimImport(
+                pasteEB and pasteEB:GetText() or "", bucket, targetSpec, tName, tClass,
+                function(s) return SimBucketFor(targetKey, s) end)
             if diffs then
-                simStatusMsg = ("|cff4cde4cImported %d item gains (%d difficulty set%s) for %s.|r"):format(
-                    items, diffs, diffs == 1 and "" or "s", SpecLabel(targetSpec))
+                local finalSpec = usedSpec or targetSpec
+                simStatusMsg = ("|cff4cde4cImported %d item gains (%d difficulty set%s) for %s%s.|r"):format(
+                    items, diffs, diffs == 1 and "" or "s", SpecLabel(finalSpec),
+                    (usedSpec and usedSpec ~= targetSpec) and " (the sim said so)" or "")
                 pasteEB:SetText("")
-                if targetKey == CharKey() and targetSpec == CurrentSpecID() then
+                if targetKey == CharKey() and finalSpec == CurrentSpecID() then
                     WipeLootPool()
                     RefreshEJ()
                 end
             else
                 local raw = pasteEB and pasteEB:GetText() or ""
-                if raw:find("^%s*[%[{]") then
+                if impErr then
+                    simStatusMsg = "|cffff6060" .. impErr .. "|r"
+                elseif raw:find("^%s*[%[{]") then
                     simStatusMsg = "|cffff6060That is the data.json - not needed, and far too big. Open the data.csv instead (press Show me how).|r"
                 else
                     simStatusMsg = "|cffff6060Could not read that. Paste the FULL text of the data.csv page.|r"
