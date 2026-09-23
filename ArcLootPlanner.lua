@@ -1566,6 +1566,26 @@ local function EnsureLootPool()
                         pool.gainSum = pool.gainSum + gain
                     end
                 end
+            elseif info and info.encounterID and not info.displayAsPerPlayerLoot
+                and info.itemID and IsTokenItem(info.itemID) and not OMNI_TOKENS[info.itemID] then
+                -- SLOT TOKEN rows are coin outcomes too (only the omni never
+                -- rolls), so the boss's token counts toward the live share
+                -- (user report: two gear pieces read 50% and the token
+                -- nothing). It stays OUT of the cached per-spec pool on
+                -- purpose: BossSimEV adds the token's PIECE as its own
+                -- outcome, and a token entry there would count it twice.
+                local pool = lootPool[info.encounterID]
+                if not pool then
+                    pool = { total = 0, owned = 0, gainSum = 0 }
+                    lootPool[info.encounterID] = pool
+                end
+                pool.total = pool.total + 1
+                local owned = IsOwnedItem(info.itemID, ownDiff)
+                if not owned then
+                    local piece = TokenPieceFor(info.itemID)
+                    if piece then owned = IsOwnedItem(piece, ownDiff) end
+                end
+                if owned then pool.owned = pool.owned + 1 end
             end
         end
         if fresh then
@@ -1983,10 +2003,13 @@ local function ItemMarkerUpdate(m)
                 local col = bGain >= 0.5 and "|cff4cde4c" or "|cff8ca0b8"
                 bonusTxt = ("%s%s|r"):format(col, FormatGainNumber(bGain, bKey))
             end
-            -- share: prefer the roll-EV remaining (it counts the token
-            -- outcomes too), fall back to the pool count when no sim
+            -- share: the LIVE journal pool (slot token included) follows the
+            -- guide's class/spec filter, so it is the denominator whenever the
+            -- boss has one; the sim's remaining count only stands in when the
+            -- journal gave us no pool at all (user report: with a sim loaded
+            -- the share ignored the loot-spec filter)
             local shareDen = remaining
-            if not dungeonMode and btn.encounterID then
+            if not pool and not dungeonMode and btn.encounterID then
                 local _bev, rr = BossSimEV(btn.encounterID, bKey, diff, diff)
                 if rr and rr > 0 then shareDen = rr end
             end
@@ -3282,6 +3305,62 @@ local DROPS_DIFFS = {
     { value = "mplus", text = "Mythic+ runs" },
 }
 
+-- ── Drops Overview slot filter (feature-want 1552310662) ─────────────────
+-- One table: the ordered slot list (dropdown items) plus the matcher. A slot
+-- other than "all" makes the Drops list expand EVERY boss and show only that
+-- slot's items, hiding bosses with none. Inventory types come from
+-- C_Item.GetItemInventoryTypeByID (InventoryType enum, Head = 1); "token"
+-- catches slotless tier tokens via IsTokenItem. Twin of ArcUI's SlotFilter.
+local SlotFilter = {
+    list = {
+        { key = "all",      text = "All Slots" },
+        { key = "head",     text = "Head",     inv = { "IndexHeadType" } },
+        { key = "neck",     text = "Neck",     inv = { "IndexNeckType" } },
+        { key = "shoulder", text = "Shoulder", inv = { "IndexShoulderType" } },
+        { key = "back",     text = "Back",     inv = { "IndexCloakType" } },
+        { key = "chest",    text = "Chest",    inv = { "IndexChestType", "IndexRobeType" } },
+        { key = "wrist",    text = "Wrist",    inv = { "IndexWristType" } },
+        { key = "hands",    text = "Hands",    inv = { "IndexHandType" } },
+        { key = "waist",    text = "Waist",    inv = { "IndexWaistType" } },
+        { key = "legs",     text = "Legs",     inv = { "IndexLegsType" } },
+        { key = "feet",     text = "Feet",     inv = { "IndexFeetType" } },
+        { key = "finger",   text = "Finger",   inv = { "IndexFingerType" } },
+        { key = "trinket",  text = "Trinket",  inv = { "IndexTrinketType" } },
+        { key = "weapon",   text = "Weapons",
+          inv = { "IndexWeaponType", "Index2HweaponType", "IndexWeaponmainhandType",
+                  "IndexWeaponoffhandType", "IndexRangedType", "IndexRangedrightType",
+                  "IndexThrownType" } },
+        { key = "offhand",  text = "Off Hand", inv = { "IndexShieldType", "IndexHoldableType" } },
+        { key = "token",    text = "Tier Tokens", token = true },
+    },
+    items = {},   -- { value = key, text = text } for AT.MakeDropdown
+}
+for _, d in ipairs(SlotFilter.list) do
+    SlotFilter.items[#SlotFilter.items + 1] = { value = d.key, text = d.text }
+end
+function SlotFilter.Matches(itemID, key)
+    if not key or key == "all" then return true end
+    local def
+    for _, d in ipairs(SlotFilter.list) do
+        if d.key == key then def = d break end
+    end
+    if not def then return true end
+    if def.token then return IsTokenItem(itemID) end
+    if not (itemID and C_Item and C_Item.GetItemInventoryTypeByID and Enum and Enum.InventoryType) then
+        return false
+    end
+    local inv = C_Item.GetItemInventoryTypeByID(itemID)
+    if inv == nil then return false end
+    for _, name in ipairs(def.inv or {}) do
+        if Enum.InventoryType[name] == inv then return true end
+    end
+    return false
+end
+function SlotFilter.Current()
+    local v = char and char.settings and char.settings.dropsSlot
+    return (type(v) == "string" and v ~= "") and v or "all"
+end
+
 -- current season dungeon list: live from the journal engine when it is free
 -- (we select the newest tier ourselves so an open journal on an old
 -- expansion can never mislead it), else the STATIC copy from a past success
@@ -3540,8 +3619,12 @@ local function OverviewItemTooltip(self)
         if linkLv ~= s.simLv then
             local b = ResolveIlvlBonus(s.simLv)
             if b then
-                GameTooltip:SetHyperlink(("item:%d::::::::%d::::1:%d"):format(
-                    s.itemID, UnitLevel("player") or 80, b))
+                -- the link's specialization field decides which primary stat a
+                -- multi-stat item highlights; empty = the item's first stat, so
+                -- a warrior read Agility/Intellect in white (Discord 1552232083).
+                -- Fill it with the player's spec, exactly like an equipped link.
+                GameTooltip:SetHyperlink(("item:%d::::::::%d:%d:::1:%d"):format(
+                    s.itemID, UnitLevel("player") or 80, CurrentSpecID() or 0, b))
                 GameTooltip:AddLine(("Shown at your sim's item level (%d)."):format(s.simLv), 0.25, 0.79, 0.95, true)
                 synthetic = true
             end
@@ -4114,6 +4197,9 @@ local function DropsRefresh(pg)
     local diff = char.settings.dropsDiff or 15
     local mplusMode = diff == "mplus"
     local ownDiff = mplusMode and MPLUS_DIFF or diff
+    -- slot filter: expands every boss, keeps only that slot's items
+    local slotKey = SlotFilter.Current()
+    local slotOn = slotKey ~= "all"
     pg.rolls:SetText("")
     if pg.pctCb then pg.pctCb:SetOn(char.settings.evPercent) end
     local haveSim = simStore[diff] ~= nil
@@ -4310,7 +4396,7 @@ local function DropsRefresh(pg)
                 bestEV, bestIdx = best, shown
             end
             row:Show()
-            if selected then
+            if selected or slotOn then
                 local ev = simStore[diff]
                 local gains, cache
                 if mplusMode then
@@ -4348,7 +4434,24 @@ local function DropsRefresh(pg)
                         list[#list + 1] = { itemID = itemID, gain = g }
                     end
                 end
-                if #list > 0 then
+                -- slot filter: keep only matching items; a real list with
+                -- nothing in the slot drops the boss row entirely (an empty
+                -- list keeps its "confirming..." placeholder below)
+                local dropBoss = false
+                if slotOn and #list > 0 then
+                    local kept = {}
+                    for _, entry in ipairs(list) do
+                        if SlotFilter.Matches(entry.itemID, slotKey) then kept[#kept + 1] = entry end
+                    end
+                    list = kept
+                    dropBoss = #list == 0
+                end
+                if dropBoss then
+                    row:Hide()
+                    if bestIdx == shown then bestIdx, bestEV = nil, nil end
+                    shown = shown - 1
+                    y = y + 30
+                elseif #list > 0 then
                     table.sort(list, function(a, b)
                         return (a.gain or -math.huge) > (b.gain or -math.huge)
                     end)
@@ -4475,10 +4578,22 @@ local function BuildOverviewPage(parent, mode)
             PageRefresh(pg)
         end)
     dd:SetPoint("TOPLEFT", 0, -4)
+    -- Drops page only: the slot filter beside the difficulty
+    local slotDD
+    if mode == "drops" then
+        slotDD = AT.MakeDropdown(win, pg, 110,
+            function() return SlotFilter.items end,
+            function() return SlotFilter.Current() end,
+            function(v)
+                char.settings.dropsSlot = (v ~= "all") and v or nil
+                PageRefresh(pg)
+            end)
+        slotDD:SetPoint("LEFT", dd, "RIGHT", 8, 0)
+    end
     -- "Show EV as percent": a real labeled toggle (the bare %/# chip read
     -- as noise) driving the ONE shared setting with the strip and Sims tab
     local pctCb = AT.MakeCheckbox(pg)
-    pctCb:SetPoint("LEFT", dd, "RIGHT", 12, 0)
+    pctCb:SetPoint("LEFT", slotDD or dd, "RIGHT", 12, 0)
     local pctLbl = pg:CreateFontString(nil, "OVERLAY")
     pctLbl:SetFont(STANDARD_TEXT_FONT, 11, "")
     pctLbl:SetPoint("LEFT", pctCb, "RIGHT", 6, 0)

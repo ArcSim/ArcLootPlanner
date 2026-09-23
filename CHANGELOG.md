@@ -1,3 +1,14 @@
+## 1.0.2
+
+### New Features
+
+- **Slot Filter** — The Drops Overview gained a Slot dropdown next to Difficulty. Pick a slot and every boss opens at once showing only that slot's drops, so all your options for it sit side by side; bosses with nothing in that slot are hidden.
+
+### Bug Fixes
+
+- **Item Tooltips** — Sim-priced items in the Bonus Roll Overview now highlight your own primary stat. Warriors saw Agility or Intellect in white and Strength greyed out on multi-stat items.
+- **Drop Chances** — Tier tokens now count as a drop in the Adventure Guide percentages, and the odds follow the guide's class and spec filter even when a sim is loaded.
+
 ## 1.0.1
 
 ### Improvements
