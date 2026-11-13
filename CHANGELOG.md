@@ -1,3 +1,17 @@
+## 1.0.3
+
+### New Features
+
+- **Season Picker** — The Bonus Roll and Drops overviews have a Season drop-down, so you can switch between this season's raids and last season's.
+
+### Improvements
+
+- **Patch 12.1.5** — Updated for the current game patch.
+
+### Bug Fixes
+
+- **Kith'ix** — The new raid now shows alongside the Venomous Abyss, with each raid's bosses under its name, instead of replacing it.
+
 ## 1.0.2
 
 ### New Features
